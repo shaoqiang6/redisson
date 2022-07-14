@@ -111,7 +111,24 @@ public class JsonJacksonCodec extends BaseCodec {
     public JsonJacksonCodec(ClassLoader classLoader, JsonJacksonCodec codec) {
         this(createObjectMapper(classLoader, codec.mapObjectMapper.copy()));
     }
-    
+
+    private static boolean warmedup = false;
+
+    private void warmup() {
+        if (getValueEncoder() == null || getValueDecoder() == null || warmedup) {
+            return;
+        }
+        warmedup = true;
+
+        try {
+            ByteBuf d = getValueEncoder().encode("testValue");
+            getValueDecoder().decode(d, null);
+            d.release();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
     protected static ObjectMapper createObjectMapper(ClassLoader classLoader, ObjectMapper om) {
         TypeFactory tf = TypeFactory.defaultInstance().withClassLoader(classLoader);
         om.setTypeFactory(tf);
@@ -119,9 +136,19 @@ public class JsonJacksonCodec extends BaseCodec {
     }
 
     public JsonJacksonCodec(ObjectMapper mapObjectMapper) {
-        this.mapObjectMapper = mapObjectMapper.copy();
+        this(mapObjectMapper, true);
+        warmup();
+    }
+
+    public JsonJacksonCodec(ObjectMapper mapObjectMapper, boolean copy) {
+        if (copy) {
+            this.mapObjectMapper = mapObjectMapper.copy();
+        } else {
+            this.mapObjectMapper = mapObjectMapper;
+        }
         init(this.mapObjectMapper);
         initTypeInclusion(this.mapObjectMapper);
+        warmup();
     }
 
     protected void initTypeInclusion(ObjectMapper mapObjectMapper) {
@@ -134,7 +161,7 @@ public class JsonJacksonCodec extends BaseCodec {
                     }
                     // fall through
                 case OBJECT_AND_NON_CONCRETE:
-                    return (t.getRawClass() == Object.class) || !t.isConcrete();
+                    return t.getRawClass() == Object.class || !t.isConcrete();
                 case NON_FINAL:
                     while (t.isArrayType()) {
                         t = t.getContentType();

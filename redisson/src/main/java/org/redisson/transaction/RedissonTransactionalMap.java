@@ -15,29 +15,21 @@
  */
 package org.redisson.transaction;
 
-import java.time.Instant;
+import org.redisson.RedissonMap;
+import org.redisson.ScanResult;
+import org.redisson.api.*;
+import org.redisson.api.mapreduce.RMapReduce;
+import org.redisson.client.RedisClient;
+import org.redisson.client.codec.Codec;
+import org.redisson.command.CommandAsyncExecutor;
+import org.redisson.transaction.operation.TransactionalOperation;
+
 import java.util.Collection;
-import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-
-import org.redisson.RedissonMap;
-import org.redisson.api.RCountDownLatch;
-import org.redisson.api.RFuture;
-import org.redisson.api.RLock;
-import org.redisson.api.RMap;
-import org.redisson.api.RPermitExpirableSemaphore;
-import org.redisson.api.RReadWriteLock;
-import org.redisson.api.RSemaphore;
-import org.redisson.api.mapreduce.RMapReduce;
-import org.redisson.client.RedisClient;
-import org.redisson.client.codec.Codec;
-import org.redisson.client.protocol.decoder.MapScanResult;
-import org.redisson.command.CommandAsyncExecutor;
-import org.redisson.transaction.operation.TransactionalOperation;
 
 /**
  * 
@@ -75,28 +67,18 @@ public class RedissonTransactionalMap<K, V> extends RedissonMap<K, V> {
     }
     
     @Override
-    public RFuture<Boolean> expireAsync(long timeToLive, TimeUnit timeUnit) {
-        throw new UnsupportedOperationException("expire method is not supported in transaction");
+    public RFuture<Boolean> expireAsync(long timeToLive, TimeUnit timeUnit, String param, String... keys) {
+        return transactionalMap.expireAsync(timeToLive, timeUnit, param, keys);
     }
     
     @Override
-    public RFuture<Boolean> expireAtAsync(Date timestamp) {
-        throw new UnsupportedOperationException("expire method is not supported in transaction");
-    }
-    
-    @Override
-    public RFuture<Boolean> expireAtAsync(long timestamp) {
-        throw new UnsupportedOperationException("expire method is not supported in transaction");
-    }
-
-    @Override
-    public RFuture<Boolean> expireAsync(Instant timestamp) {
-        throw new UnsupportedOperationException("expire method is not supported in transaction");
+    protected RFuture<Boolean> expireAtAsync(long timestamp, String param, String... keys) {
+        return transactionalMap.expireAtAsync(timestamp, param, keys);
     }
 
     @Override
     public RFuture<Boolean> clearExpireAsync() {
-        throw new UnsupportedOperationException("clearExpire method is not supported in transaction");
+        return transactionalMap.clearExpireAsync();
     }
     
     @Override
@@ -115,8 +97,8 @@ public class RedissonTransactionalMap<K, V> extends RedissonMap<K, V> {
     }
     
     @Override
-    public MapScanResult<Object, Object> scanIterator(String name, RedisClient client,
-            long startPos, String pattern, int count) {
+    public ScanResult<Map.Entry<Object, Object>> scanIterator(String name, RedisClient client,
+                                                   long startPos, String pattern, int count) {
         checkState();
         return transactionalMap.scanIterator(name, client, startPos, pattern, count);
     }

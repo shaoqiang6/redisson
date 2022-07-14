@@ -15,10 +15,7 @@
  */
 package org.redisson;
 
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.concurrent.TimeUnit;
-
+import io.netty.buffer.ByteBuf;
 import org.redisson.api.RFuture;
 import org.redisson.api.RList;
 import org.redisson.api.RListMultimapCache;
@@ -27,7 +24,9 @@ import org.redisson.client.protocol.RedisCommands;
 import org.redisson.command.CommandAsyncExecutor;
 import org.redisson.eviction.EvictionScheduler;
 
-import io.netty.buffer.ByteBuf;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @author Nikita Koksharov
@@ -203,13 +202,13 @@ public class RedissonListMultimapCache<K, V> extends RedissonListMultimap<K, V> 
     }
 
     @Override
-    public RFuture<Boolean> expireAsync(long timeToLive, TimeUnit timeUnit) {
-        return baseCache.expireAsync(timeToLive, timeUnit);
+    public RFuture<Boolean> expireAsync(long timeToLive, TimeUnit timeUnit, String param, String... keys) {
+        return baseCache.expireAsync(timeToLive, timeUnit, param);
     }
 
     @Override
-    public RFuture<Boolean> expireAtAsync(long timestamp) {
-        return baseCache.expireAtAsync(timestamp);
+    protected RFuture<Boolean> expireAtAsync(long timestamp, String param, String... keys) {
+        return baseCache.expireAtAsync(timestamp, param);
     }
 
     @Override

@@ -1,6 +1,7 @@
 package org.redisson;
 
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RDeque;
 import org.redisson.api.queue.DequeMoveArgs;
@@ -27,6 +28,8 @@ public class RedissonDequeTest extends BaseTest {
 
     @Test
     public void testMove() {
+        Assumptions.assumeTrue(RedisRunner.getDefaultRedisServerInstance().getRedisVersion().compareTo("6.2.0") > 0);
+
         RDeque<Integer> deque1 = redisson.getDeque("deque1");
         RDeque<Integer> deque2 = redisson.getDeque("deque2");
 
@@ -136,6 +139,16 @@ public class RedissonDequeTest extends BaseTest {
 
         assertThat(queue).containsExactly(3, 2, 1);
    }
+
+    @Test
+    public void testAddFirstLastMulti() {
+        RDeque<Integer> queue = redisson.getDeque("deque");
+        queue.addAll(Arrays.asList(1, 2, 3, 4));
+        queue.addFirst(0, 1, 0);
+        queue.addLast(10, 20, 10);
+
+        assertThat(queue).containsExactly(0, 1, 0, 1, 2, 3, 4, 10, 20, 10);
+    }
 
     @Test
     public void testAddFirst() {

@@ -28,6 +28,7 @@ import org.redisson.command.CommandBatchService;
 import org.redisson.liveobject.misc.ClassUtils;
 import org.redisson.liveobject.resolver.NamingScheme;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /**
@@ -80,7 +81,7 @@ public class LiveObjectInterceptor {
             @FieldValue("liveObjectLiveMap") RMap<String, ?> map,
             @FieldProxy("liveObjectLiveMap") Setter mapSetter,
             @FieldProxy("liveObjectLiveMap") Getter mapGetter
-    ) throws Exception {
+    ) throws Throwable {
         if ("setLiveObjectId".equals(method.getName())) {
             if (args[0].getClass().isArray()) {
                 throw new UnsupportedOperationException("RId value cannot be an array.");
@@ -127,10 +128,14 @@ public class LiveObjectInterceptor {
             RFuture<Long> deleteFuture = service.delete(idd, me.getClass().getSuperclass(), namingScheme, ce);
             ce.execute();
             
-            return deleteFuture.getNow() > 0;
+            return commandExecutor.get(deleteFuture.toCompletableFuture()) > 0;
         }
 
-        return method.invoke(map, args);
+        try {
+            return method.invoke(map, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
     }
 
 

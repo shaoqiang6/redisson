@@ -65,10 +65,10 @@ public class RedissonMapRxIterator<K, V, M> {
                     nextValues();
                     completed = false;
                 }
-            };
+            }
             
             protected void nextValues() {
-                map.scanIteratorAsync(map.getRawName(), client, nextIterPos, pattern, count).onComplete((res, e) -> {
+                map.scanIteratorAsync(map.getRawName(), client, nextIterPos, pattern, count).whenComplete((res, e) -> {
                     if (e != null) {
                         p.onError(e);
                         return;
@@ -83,7 +83,7 @@ public class RedissonMapRxIterator<K, V, M> {
                     client = res.getRedisClient();
                     nextIterPos = res.getPos();
                     
-                    for (Entry<Object, Object> entry : res.getMap().entrySet()) {
+                    for (Entry<Object, Object> entry : res.getValues()) {
                         M val = getValue(entry);
                         p.onNext(val);
                         elementsRead.incrementAndGet();

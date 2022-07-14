@@ -17,16 +17,14 @@ package org.redisson.client.handler;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
 import org.redisson.client.ChannelName;
 import org.redisson.client.RedisClientConfig;
 import org.redisson.client.RedisPubSubConnection;
 import org.redisson.client.codec.ByteArrayCodec;
 import org.redisson.client.codec.Codec;
 import org.redisson.client.codec.StringCodec;
-import org.redisson.client.protocol.CommandData;
-import org.redisson.client.protocol.Decoder;
-import org.redisson.client.protocol.QueueCommand;
-import org.redisson.client.protocol.RedisCommands;
+import org.redisson.client.protocol.*;
 import org.redisson.client.protocol.decoder.ListObjectDecoder;
 import org.redisson.client.protocol.decoder.MultiDecoder;
 import org.redisson.client.protocol.pubsub.Message;
@@ -47,7 +45,9 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class CommandPubSubDecoder extends CommandDecoder {
 
-    private static final Set<String> MESSAGES = new HashSet<String>(Arrays.asList("subscribe", "psubscribe", "punsubscribe", "unsubscribe"));
+    private static final Set<String> UNSUBSCRIBE_COMMANDS = new HashSet<>(Arrays.asList(RedisCommands.PUNSUBSCRIBE.getName(), RedisCommands.UNSUBSCRIBE.getName(), RedisCommands.SUNSUBSCRIBE.getName()));
+    private static final Set<String> SUBSCRIBE_COMMANDS = new HashSet<>(Arrays.asList(RedisCommands.PSUBSCRIBE.getName(), RedisCommands.SUBSCRIBE.getName(), RedisCommands.SSUBSCRIBE.getName()));
+    private static final Set<String> MESSAGES = new HashSet<String>(Arrays.asList("subscribe", "psubscribe", "punsubscribe", "unsubscribe", "ssubscribe", "sunsubscribe"));
     // It is not needed to use concurrent map because responses are coming consecutive
     private final Map<ChannelName, PubSubEntry> entries = new HashMap<>();
     private final Map<PubSubKey, CommandData<Object, Object>> commands = new ConcurrentHashMap<>();
@@ -65,7 +65,21 @@ public class CommandPubSubDecoder extends CommandDecoder {
     }
 
     @Override
-    protected void decodeCommand(Channel channel, ByteBuf in, QueueCommand data) throws Exception {
+    protected QueueCommand getCommand(ChannelHandlerContext ctx) {
+        return ctx.channel().attr(CommandsQueuePubSub.CURRENT_COMMAND).get();
+    }
+
+    @Override
+    protected void sendNext(Channel channel) {
+        CommandsQueuePubSub handler = channel.pipeline().get(CommandsQueuePubSub.class);
+        if (handler != null) {
+            handler.sendNextCommand(channel);
+        }
+        state(null);
+    }
+
+    @Override
+    protected void decodeCommand(Channel channel, ByteBuf in, QueueCommand data, int endIndex) throws Exception {
         if (data == null) {
             try {
                 while (in.writerIndex() > in.readerIndex()) {
@@ -113,12 +127,12 @@ public class CommandPubSubDecoder extends CommandDecoder {
                 String operation = ((PubSubStatusMessage) result).getType().name().toLowerCase();
                 PubSubKey key = new PubSubKey(channelName, operation);
                 CommandData<Object, Object> d = commands.get(key);
-                if (Arrays.asList(RedisCommands.PSUBSCRIBE.getName(), RedisCommands.SUBSCRIBE.getName()).contains(d.getCommand().getName())) {
+                if (SUBSCRIBE_COMMANDS.contains(d.getCommand().getName())) {
                     commands.remove(key);
                     entries.put(channelName, new PubSubEntry(d.getMessageDecoder()));
                 }
                 
-                if (Arrays.asList(RedisCommands.PUNSUBSCRIBE.getName(), RedisCommands.UNSUBSCRIBE.getName()).contains(d.getCommand().getName())) {
+                if (UNSUBSCRIBE_COMMANDS.contains(d.getCommand().getName())) {
                     commands.remove(key);
                     if (result instanceof PubSubPatternMessage) {
                         channelName = ((PubSubPatternMessage) result).getPattern();
@@ -196,7 +210,7 @@ public class CommandPubSubDecoder extends CommandDecoder {
     
     @Override
     protected MultiDecoder<Object> messageDecoder(CommandData<Object, Object> data, List<Object> parts) {
-        if (parts.isEmpty()) {
+        if (parts.isEmpty() || parts.get(0) == null) {
             return null;
         }
         String command = parts.get(0).toString();

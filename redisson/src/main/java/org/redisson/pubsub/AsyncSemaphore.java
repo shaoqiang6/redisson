@@ -27,71 +27,64 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class AsyncSemaphore {
 
     private final AtomicInteger counter;
-    private final Queue<Runnable> listeners = new ConcurrentLinkedQueue<>();
-    private final Set<Runnable> removedListeners = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private final Queue<CompletableFuture<Void>> listeners = new ConcurrentLinkedQueue<>();
 
     public AsyncSemaphore(int permits) {
         counter = new AtomicInteger(permits);
     }
     
     public boolean tryAcquire(long timeoutMillis) {
-        CountDownLatch latch = new CountDownLatch(1);
-        Runnable runnable = () -> latch.countDown();
-        acquire(runnable);
-        
+        CompletableFuture<Void> f = acquire();
         try {
-            boolean r = latch.await(timeoutMillis, TimeUnit.MILLISECONDS);
-            if (!r) {
-                remove(runnable);
-            }
-            return r;
+            f.get(timeoutMillis, TimeUnit.MILLISECONDS);
+            return true;
         } catch (InterruptedException e) {
-            remove(runnable);
             Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException e) {
+            throw new IllegalStateException(e);
+        } catch (TimeoutException e) {
             return false;
         }
     }
 
     public int queueSize() {
-        return listeners.size() - removedListeners.size();
+        return listeners.size();
     }
     
     public void removeListeners() {
         listeners.clear();
-        removedListeners.clear();
     }
-    
-    public void acquire(Runnable listener) {
-        listeners.add(listener);
+
+    public CompletableFuture<Void> acquire() {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        listeners.add(future);
         tryRun();
+        return future;
+    }
+
+    public void acquire(Runnable listener) {
+        acquire().thenAccept(r -> listener.run());
     }
 
     private void tryRun() {
-        if (counter.get() == 0
-                || listeners.peek() == null) {
-            return;
-        }
+        while (true) {
+            if (counter.decrementAndGet() >= 0) {
+                CompletableFuture<Void> future = listeners.poll();
+                if (future == null) {
+                    counter.incrementAndGet();
+                    return;
+                }
 
-        if (counter.decrementAndGet() >= 0) {
-            Runnable listener = listeners.poll();
-            if (listener == null) {
-                counter.incrementAndGet();
+                if (future.complete(null)) {
+                    return;
+                }
+            }
+
+            if (counter.incrementAndGet() <= 0) {
                 return;
             }
-
-            if (removedListeners.remove(listener)) {
-                counter.incrementAndGet();
-                tryRun();
-            } else {
-                listener.run();
-            }
-        } else {
-            counter.incrementAndGet();
         }
-    }
-
-    public void remove(Runnable listener) {
-        removedListeners.add(listener);
     }
 
     public int getCounter() {

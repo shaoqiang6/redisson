@@ -15,36 +15,21 @@
  */
 package org.redisson;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
-
-import org.redisson.api.RCountDownLatch;
-import org.redisson.api.RFuture;
-import org.redisson.api.RLock;
-import org.redisson.api.RPermitExpirableSemaphore;
-import org.redisson.api.RReadWriteLock;
-import org.redisson.api.RSemaphore;
-import org.redisson.api.RSetCache;
-import org.redisson.api.RedissonClient;
+import io.netty.buffer.ByteBuf;
+import org.redisson.api.*;
 import org.redisson.api.mapreduce.RCollectionMapReduce;
 import org.redisson.client.RedisClient;
 import org.redisson.client.codec.Codec;
 import org.redisson.client.protocol.RedisCommands;
-import org.redisson.client.protocol.decoder.ListScanResult;
 import org.redisson.command.CommandAsyncExecutor;
 import org.redisson.eviction.EvictionScheduler;
 import org.redisson.iterator.RedissonBaseIterator;
 import org.redisson.mapreduce.RedissonCollectionMapReduce;
-import org.redisson.misc.RedissonPromise;
+import org.redisson.misc.CompletableFutureWrapper;
 
-import io.netty.buffer.ByteBuf;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 /**
  * <p>Set-based cache with ability to set TTL for each entry via
@@ -130,13 +115,13 @@ public class RedissonSetCache<V> extends RedissonExpirable implements RSetCache<
     }
 
     @Override
-    public ListScanResult<Object> scanIterator(String name, RedisClient client, long startPos, String pattern, int count) {
-        RFuture<ListScanResult<Object>> f = scanIteratorAsync(name, client, startPos, pattern, count);
+    public ScanResult<Object> scanIterator(String name, RedisClient client, long startPos, String pattern, int count) {
+        RFuture<ScanResult<Object>> f = scanIteratorAsync(name, client, startPos, pattern, count);
         return get(f);
     }
 
     @Override
-    public RFuture<ListScanResult<Object>> scanIteratorAsync(String name, RedisClient client, long startPos, String pattern, int count) {
+    public RFuture<ScanResult<Object>> scanIteratorAsync(String name, RedisClient client, long startPos, String pattern, int count) {
         List<Object> params = new ArrayList<Object>();
         params.add(startPos);
         params.add(System.currentTimeMillis());
@@ -179,7 +164,7 @@ public class RedissonSetCache<V> extends RedissonExpirable implements RSetCache<
         return new RedissonBaseIterator<V>() {
 
             @Override
-            protected ListScanResult<Object> iterator(RedisClient client, long nextIterPos) {
+            protected ScanResult<Object> iterator(RedisClient client, long nextIterPos) {
                 return scanIterator(getRawName(), client, nextIterPos, pattern, count);
             }
 
@@ -321,7 +306,7 @@ public class RedissonSetCache<V> extends RedissonExpirable implements RSetCache<
     @Override
     public RFuture<Boolean> containsAllAsync(Collection<?> c) {
         if (c.isEmpty()) {
-            return RedissonPromise.newSucceededFuture(true);
+            return new CompletableFutureWrapper<>(true);
         }
         
         List<Object> params = new ArrayList<Object>(c.size() + 1);
@@ -351,7 +336,7 @@ public class RedissonSetCache<V> extends RedissonExpirable implements RSetCache<
     @Override
     public RFuture<Boolean> addAllAsync(Collection<? extends V> c) {
         if (c.isEmpty()) {
-            return RedissonPromise.newSucceededFuture(false);
+            return new CompletableFutureWrapper<>(false);
         }
 
         long score = 92233720368547758L - System.currentTimeMillis();
@@ -396,7 +381,7 @@ public class RedissonSetCache<V> extends RedissonExpirable implements RSetCache<
     @Override
     public RFuture<Boolean> removeAllAsync(Collection<?> c) {
         if (c.isEmpty()) {
-            return RedissonPromise.newSucceededFuture(false);
+            return new CompletableFutureWrapper<>(false);
         }
         
         List<Object> params = new ArrayList<Object>(c.size()+1);

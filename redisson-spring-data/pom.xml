@@ -4,7 +4,7 @@
     <parent>
         <groupId>org.redisson</groupId>
         <artifactId>redisson-parent</artifactId>
-        <version>3.15.6-SNAPSHOT</version>
+        <version>3.17.5-SNAPSHOT</version>
         <relativePath>../</relativePath>
     </parent>
 
@@ -22,6 +22,9 @@
         <module>redisson-spring-data-22</module>
         <module>redisson-spring-data-23</module>
         <module>redisson-spring-data-24</module>
+        <module>redisson-spring-data-25</module>
+        <module>redisson-spring-data-26</module>
+        <module>redisson-spring-data-27</module>
     </modules>
 
     <build>

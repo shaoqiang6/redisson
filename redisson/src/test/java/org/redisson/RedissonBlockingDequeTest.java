@@ -2,6 +2,7 @@ package org.redisson;
 
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RBlockingDeque;
 import org.redisson.api.queue.DequeMoveArgs;
@@ -17,6 +18,8 @@ public class RedissonBlockingDequeTest extends BaseTest {
 
     @Test
     public void testMove() {
+        Assumptions.assumeTrue(RedisRunner.getDefaultRedisServerInstance().getRedisVersion().compareTo("6.2.0") > 0);
+
         RBlockingDeque<Integer> deque1 = redisson.getBlockingDeque("deque1");
         RBlockingDeque<Integer> deque2 = redisson.getBlockingDeque("deque2");
 
@@ -66,10 +69,10 @@ public class RedissonBlockingDequeTest extends BaseTest {
     @Test
     public void testPollLastAndOfferFirstTo() throws InterruptedException {
         RBlockingDeque<String> blockingDeque = redisson.getBlockingDeque("blocking_deque");
-        long start = System.currentTimeMillis();
-        String redisTask = blockingDeque.pollLastAndOfferFirstTo("deque", 1, TimeUnit.SECONDS);
-        assertThat(System.currentTimeMillis() - start).isBetween(950L, 1100L);
-        assertThat(redisTask).isNull();
+        Awaitility.await().between(Duration.ofMillis(1000), Duration.ofMillis(1200)).untilAsserted(() -> {
+            String redisTask = blockingDeque.pollLastAndOfferFirstTo("deque", 1, TimeUnit.SECONDS);
+            assertThat(redisTask).isNull();
+        });
     }
     
     @Test

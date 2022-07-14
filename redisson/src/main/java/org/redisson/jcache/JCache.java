@@ -27,13 +27,14 @@ import org.redisson.client.protocol.RedisCommands;
 import org.redisson.client.protocol.decoder.MapScanResult;
 import org.redisson.client.protocol.decoder.MapValueDecoder;
 import org.redisson.codec.BaseEventCodec;
+import org.redisson.command.CommandAsyncExecutor;
+import org.redisson.connection.MasterSlaveEntry;
 import org.redisson.connection.decoder.MapGetAllDecoder;
 import org.redisson.iterator.RedissonBaseMapIterator;
 import org.redisson.jcache.JMutableEntry.Action;
 import org.redisson.jcache.configuration.JCacheConfiguration;
+import org.redisson.misc.CompletableFutureWrapper;
 import org.redisson.misc.Hash;
-import org.redisson.misc.RPromise;
-import org.redisson.misc.RedissonPromise;
 import org.redisson.reactive.ReactiveProxyBuilder;
 import org.redisson.rx.RxProxyBuilder;
 
@@ -52,14 +53,12 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 /**
  * JCache implementation
- * 
+ *
  * @author Nikita Koksharov
  *
  * @param <K> key
@@ -68,18 +67,17 @@ import java.util.stream.Collectors;
 public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAsync<K, V> {
 
     final boolean atomicExecution = System.getProperty("org.jsr107.tck.management.agentId") == null;
-    
+
     final JCacheManager cacheManager;
     final JCacheConfiguration<K, V> config;
-    private final ConcurrentMap<CacheEntryListenerConfiguration<K, V>, Map<Integer, String>> listeners = 
-                                        new ConcurrentHashMap<CacheEntryListenerConfiguration<K, V>, Map<Integer, String>>();
+    private final ConcurrentMap<CacheEntryListenerConfiguration<K, V>, Map<Integer, String>> listeners = new ConcurrentHashMap<>();
     final Redisson redisson;
 
     private CacheLoader<K, V> cacheLoader;
     private CacheWriter<K, V> cacheWriter;
     private boolean closed;
     private boolean hasOwnRedisson;
-    
+
     /*
      * No locking required in atomic execution mode.
      */
@@ -89,13 +87,13 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             return null;
         }
     });
-    
+
     public JCache(JCacheManager cacheManager, Redisson redisson, String name, JCacheConfiguration<K, V> config, boolean hasOwnRedisson) {
         super(redisson.getConfig().getCodec(), redisson.getCommandExecutor(), name);
-        
+
         this.hasOwnRedisson = hasOwnRedisson;
         this.redisson = redisson;
-        
+
         Factory<CacheLoader<K, V>> cacheLoaderFactory = config.getCacheLoaderFactory();
         if (cacheLoaderFactory != null) {
             cacheLoader = cacheLoaderFactory.create();
@@ -104,27 +102,31 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         if (config.getCacheWriterFactory() != null) {
             cacheWriter = (CacheWriter<K, V>) cacheWriterFactory.create();
         }
-        
+
         this.cacheManager = cacheManager;
         this.config = config;
-        
+
         redisson.getEvictionScheduler().scheduleJCache(getRawName(), getTimeoutSetName(), getExpiredChannelName());
-        
+
         for (CacheEntryListenerConfiguration<K, V> listenerConfig : config.getCacheEntryListenerConfigurations()) {
             registerCacheEntryListener(listenerConfig, false);
         }
     }
-    
+
     void checkNotClosed() {
         if (closed) {
             throw new IllegalStateException();
         }
     }
-    
+
     String getTimeoutSetName() {
         return "jcache_timeout_set:{" + getRawName() + "}";
     }
-    
+
+    String getTimeoutSetName(String name) {
+        return prefixName("jcache_timeout_set", name);
+    }
+
     String getSyncName(Object syncId) {
         return "jcache_sync:" + syncId + ":{" + getRawName() + "}";
     }
@@ -132,33 +134,61 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     String getCreatedSyncChannelName() {
         return "jcache_created_sync_channel:{" + getRawName() + "}";
     }
-    
+
+    String getCreatedSyncChannelName(String name) {
+        return prefixName("jcache_created_sync_channel", name);
+    }
+
     String getUpdatedSyncChannelName() {
         return "jcache_updated_sync_channel:{" + getRawName() + "}";
+    }
+
+    String getUpdatedSyncChannelName(String name) {
+        return prefixName("jcache_updated_sync_channel", name);
     }
 
     String getRemovedSyncChannelName() {
         return "jcache_removed_sync_channel:{" + getRawName() + "}";
     }
-    
+
+    String getRemovedSyncChannelName(String name) {
+        return prefixName("jcache_removed_sync_channel", name);
+    }
+
     String getCreatedChannelName() {
         return "jcache_created_channel:{" + getRawName() + "}";
     }
-    
+
+    String getCreatedChannelName(String name) {
+        return prefixName("jcache_created_channel", name);
+    }
+
     String getUpdatedChannelName() {
         return "jcache_updated_channel:{" + getRawName() + "}";
+    }
+
+    String getUpdatedChannelName(String name) {
+        return prefixName("jcache_updated_channel", name);
     }
 
     String getExpiredChannelName() {
         return "jcache_expired_channel:{" + getRawName() + "}";
     }
-    
+
+    String getRemovedChannelName(String name) {
+        return prefixName("jcache_removed_channel", name);
+    }
+
     String getRemovedChannelName() {
         return "jcache_removed_channel:{" + getRawName() + "}";
     }
 
     String getOldValueListenerCounter() {
         return "jcache_old_value_listeners:{" + getRawName() + "}";
+    }
+
+    String getOldValueListenerCounter(String name) {
+        return prefixName("jcache_old_value_listeners", name);
     }
 
     long currentNanoTime() {
@@ -168,19 +198,41 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         return 0;
     }
 
-    protected void checkKey(Object key) {
+    void checkKey(Object key) {
         if (key == null) {
             throw new NullPointerException();
         }
     }
-    
+
+    <V> CompletionStage<V> handleException(CompletionStage<V> f) {
+        return f.handle((r, e) -> {
+            if (e != null) {
+                if (e instanceof CompletionException) {
+                    throw (RuntimeException) e.getCause();
+                }
+                throw new CompletionException(new CacheException(e));
+            }
+            return r;
+        });
+    }
+
+    <V> V sync(RFuture<V> result) {
+        try {
+            return result.toCompletableFuture().join();
+        } catch (Exception e) {
+            if (e.getCause() != null) {
+                throw (RuntimeException) e.getCause();
+            }
+            throw e;
+        }
+    }
+
     @Override
     public V get(K key) {
         RLock lock = getLockedLock(key);
         try {
             RFuture<V> result = getAsync(key);
-            result.syncUninterruptibly();
-            return result.getNow();
+            return sync(result);
         } finally {
             lock.unlock();
         }
@@ -197,13 +249,13 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             future = getValue(key);
         } else {
             V value = getValueLocked(key);
-            future = RedissonPromise.newSucceededFuture(value);
+            future = new CompletableFutureWrapper<>(value);
         }
 
-        RPromise<V> result = new RedissonPromise<>();
-        future.onComplete((value, e) -> {
+        CompletableFuture<V> result = new CompletableFuture<>();
+        future.whenComplete((value, e) -> {
             if (e != null) {
-                result.tryFailure(new CacheException(e));
+                result.completeExceptionally(new CacheException(e));
                 return;
             }
 
@@ -213,9 +265,9 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     redisson.getConnectionManager().getExecutor().execute(() -> {
                         try {
                             V val = loadValue(key);
-                            result.trySuccess(val);
+                            result.complete(val);
                         } catch (Exception ex) {
-                            result.tryFailure(ex);
+                            result.completeExceptionally(ex);
                         }
                     });
                     return;
@@ -224,13 +276,13 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                 cacheManager.getStatBean(this).addHits(1);
             }
-            result.trySuccess(value);
+            result.complete(value);
         });
-        return result;
+        return new CompletableFutureWrapper<>(result);
     }
-    
+
     V getValueLocked(K key) {
-        
+
         V value = evalWrite(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE,
                 "local value = redis.call('hget', KEYS[1], ARGV[3]); "
               + "if value == false then "
@@ -244,7 +296,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
               + "return value; ",
               Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName()),
               0, System.currentTimeMillis(), encodeMapKey(key));
-        
+
         if (value != null) {
             Long accessTimeout = getAccessTimeout();
             if (accessTimeout == -1) {
@@ -264,17 +316,17 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[3]), ARGV[3], string.len(tostring(value)), tostring(value), ARGV[4]); "
                   + "local syncs = redis.call('publish', KEYS[4], syncMsg); "
                   + "return syncs;"
-              + "elseif ARGV[1] ~= '-1' then " 
+              + "elseif ARGV[1] ~= '-1' then "
                   + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[3]); "
                   + "return 0;"
               + "end; ",
              Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(),
-                     getRemovedSyncChannelName()), 
+                     getRemovedSyncChannelName()),
              accessTimeout, System.currentTimeMillis(), encodeMapKey(key), syncId);
-            
+
             result.add(syncs);
             result.add(syncId);
-            
+
             waitSync(result);
             return value;
         }
@@ -284,46 +336,48 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
 
     RFuture<V> getValue(K key) {
         Long accessTimeout = getAccessTimeout();
-        
+
         if (accessTimeout == -1) {
-            return commandExecutor.evalReadAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE,
+            String name = getRawName(key);
+            return commandExecutor.evalReadAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
                     "local value = redis.call('hget', KEYS[1], ARGV[3]); "
                   + "if value == false then "
                       + "return nil; "
                   + "end; "
-                      
+
                   + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[3]); "
                   + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[2]) then "
                       + "return nil; "
                   + "end; "
-                  
+
                   + "return value; ",
-                 Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName()),
+                 Arrays.<Object>asList(name, getTimeoutSetName(name), getRemovedChannelName(name)),
                  accessTimeout, System.currentTimeMillis(), encodeMapKey(key));
         }
-        
-        return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE,
+
+        String name = getRawName(key);
+        return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
                 "local value = redis.call('hget', KEYS[1], ARGV[3]); "
               + "if value == false then "
                   + "return nil; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[3]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[2]) then "
                   + "return nil; "
               + "end; "
-              
+
               + "if ARGV[1] == '0' then "
                   + "redis.call('hdel', KEYS[1], ARGV[3]); "
                   + "redis.call('zrem', KEYS[2], ARGV[3]); "
                   + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[3]), ARGV[3], string.len(tostring(value)), tostring(value)); "
                   + "redis.call('publish', KEYS[3], msg); "
-              + "elseif ARGV[1] ~= '-1' then " 
+              + "elseif ARGV[1] ~= '-1' then "
                   + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[3]); "
               + "end; "
 
               + "return value; ",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName()),
+             Arrays.<Object>asList(name, getTimeoutSetName(name), getRemovedChannelName(name)),
              accessTimeout, System.currentTimeMillis(), encodeMapKey(key));
     }
 
@@ -344,7 +398,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     Long getAccessTimeout() {
         return getAccessTimeout(System.currentTimeMillis());
     }
-    
+
     V loadValue(K key) {
         V value = null;
         try {
@@ -363,7 +417,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         }
         return value;
     }
-    
+
     private <T, R> R write(String key, RedisCommand<T> command, Object... params) {
         RFuture<R> future = commandExecutor.writeAsync(key, command, params);
         try {
@@ -372,7 +426,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             throw new CacheException(e);
         }
     }
-    
+
     <T, R> R evalWrite(String key, Codec codec, RedisCommand<T> evalCommandType, String script, List<Object> keys, Object... params) {
         RFuture<R> future = commandExecutor.evalWriteAsync(key, codec, evalCommandType, script, keys, params);
         try {
@@ -381,7 +435,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             throw new CacheException(e);
         }
     }
-    
+
     <T, R> R evalRead(String key, Codec codec, RedisCommand<T> evalCommandType, String script, List<Object> keys, Object... params) {
         RFuture<R> future = commandExecutor.evalReadAsync(key, codec, evalCommandType, script, keys, params);
         try {
@@ -390,10 +444,10 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             throw new CacheException(e);
         }
     }
-    
+
     private boolean putValueLocked(K key, Object value) {
         double syncId = ThreadLocalRandom.current().nextDouble();
-        
+
         if (containsKey(key)) {
             Long updateTimeout = getUpdateTimeout();
             List<Object> res = evalWrite(getRawName(), codec, RedisCommands.EVAL_LIST,
@@ -444,13 +498,13 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                  Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getCreatedChannelName(), getRemovedChannelName(), getUpdatedChannelName(),
                          getCreatedSyncChannelName(), getRemovedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
                  0, updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-            
+
             res.add(syncId);
             waitSync(res);
-            
+
             return (Long) res.get(0) == 1;
         }
-        
+
         Long creationTimeout = getCreationTimeout();
         if (creationTimeout == 0) {
             return false;
@@ -473,18 +527,61 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                       + "return {1, syncs};"
                   + "end; ",
              Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getCreatedChannelName(), getRemovedChannelName(), getUpdatedChannelName(),
-                     getCreatedSyncChannelName(), getRemovedSyncChannelName(), getUpdatedSyncChannelName()), 
+                     getCreatedSyncChannelName(), getRemovedSyncChannelName(), getUpdatedSyncChannelName()),
              creationTimeout, 0, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-        
+
         res.add(syncId);
         waitSync(res);
-        
+
         return (Long) res.get(0) == 1;
 
     }
 
 
     RFuture<Long> putAllValues(Map<? extends K, ? extends V> map) {
+        double syncId = ThreadLocalRandom.current().nextDouble();
+        RFuture<List<Object>> res = putAllOperation(commandExecutor, syncId, null, getRawName(), map);
+
+        RFuture<Long> result = handlePutAllResult(syncId, res);
+        return result;
+    }
+
+    RFuture<Long> handlePutAllResult(double syncId, CompletionStage<List<Object>> res) {
+        if (atomicExecution) {
+            CompletionStage<Long> f = res.thenCompose(r -> {
+                Long added = (Long) r.get(0);
+                Long syncs = (Long) r.get(1);
+                if (syncs > 0) {
+                    RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
+                    return semaphore.acquireAsync(syncs.intValue()).thenCompose(obj1 -> {
+                        return semaphore.deleteAsync().thenApply(obj -> added);
+                    });
+                }
+                return CompletableFuture.completedFuture(added);
+            });
+            f = handleException(f);
+            return new CompletableFutureWrapper<>(f);
+        } else {
+            List<Object> r = res.toCompletableFuture().join();
+
+            Long added = (Long) r.get(0);
+            Long syncs = (Long) r.get(1);
+            if (syncs > 0) {
+                RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
+                try {
+                    semaphore.acquire(syncs.intValue());
+                    semaphore.delete();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            return new CompletableFutureWrapper<>(added);
+        }
+    }
+
+    RFuture<List<Object>> putAllOperation(CommandAsyncExecutor commandExecutor, double syncId,
+                                          MasterSlaveEntry msEntry, String name, Map<? extends K, ? extends V> map) {
         Long creationTimeout = getCreationTimeout();
         Long updateTimeout = getUpdateTimeout();
 
@@ -492,16 +589,14 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         params.add(creationTimeout);
         params.add(updateTimeout);
         params.add(System.currentTimeMillis());
-        double syncId = ThreadLocalRandom.current().nextDouble();
         params.add(syncId);
-        
+
         for (Map.Entry<? extends K, ? extends V> entry : map.entrySet()) {
             params.add(encodeMapKey(entry.getKey()));
             params.add(encodeMapValue(entry.getValue()));
         }
-        
-        RFuture<List<Object>> res = commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LIST,
-              "local added = 0; "
+
+        String script = "local added = 0; "
             + "local syncs = 0; "
             + "for i = 5, #ARGV, 2 do " +
                 "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[i]);" +
@@ -573,69 +668,28 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 + "end; "
             + "end; "
           + "end; "
-          + "return {added, syncs};",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getCreatedChannelName(), getRemovedChannelName(), getUpdatedChannelName(),
-                     getCreatedSyncChannelName(), getRemovedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
-                     params.toArray());
-        
-        RPromise<Long> result = new RedissonPromise<>();
-        if (atomicExecution) {
-            res.onComplete((r, e) -> {
-                if (e != null) {
-                    result.tryFailure(new CacheException(e));
-                    return;
-                }
-                
-                Long added = (Long) r.get(0);
-                Long syncs = (Long) r.get(1);
-                if (syncs > 0) {
-                    RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
-                    semaphore.acquireAsync(syncs.intValue()).onComplete((obj1, ex) -> {
-                        if (ex != null) {
-                            result.tryFailure(new CacheException(ex));
-                            return;
-                        }
-                        semaphore.deleteAsync().onComplete((obj, exc) -> {
-                            if (exc != null) {
-                                result.tryFailure(new CacheException(exc));
-                                return;
-                            }
-                            result.trySuccess(added);
-                        });
-                    });
-                } else {
-                    result.trySuccess(added);
-                }
-            });
-        } else {
-            res.syncUninterruptibly();
-            
-            List<Object> r = res.getNow();
-            Long added = (Long) r.get(0);
-            Long syncs = (Long) r.get(1);
-            if (syncs > 0) {
-                RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
-                try {
-                    semaphore.acquire(syncs.intValue());
-                    semaphore.delete();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            
-            result.trySuccess(added);
+          + "return {added, syncs};";
+
+        if (msEntry == null) {
+            return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_LIST, script,
+                    Arrays.asList(name, getTimeoutSetName(name), getCreatedChannelName(name), getRemovedChannelName(name), getUpdatedChannelName(name),
+                            getCreatedSyncChannelName(name), getRemovedSyncChannelName(name), getUpdatedSyncChannelName(name), getOldValueListenerCounter(name)),
+                    params.toArray());
         }
-        
-        return result;
-        
+
+        return commandExecutor.evalWriteAsync(msEntry, codec, RedisCommands.EVAL_LIST, script,
+                    Arrays.asList(name, getTimeoutSetName(name), getCreatedChannelName(name), getRemovedChannelName(name), getUpdatedChannelName(name),
+                            getCreatedSyncChannelName(name), getRemovedSyncChannelName(name), getUpdatedSyncChannelName(name), getOldValueListenerCounter(name)),
+                    params.toArray());
     }
-    
+
     RFuture<Boolean> putValue(K key, Object value) {
         double syncId = ThreadLocalRandom.current().nextDouble();
         Long creationTimeout = getCreationTimeout();
         Long updateTimeout = getUpdateTimeout();
-        
-        RFuture<List<Object>> res = commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LIST,
+
+        String name = getRawName(key);
+        RFuture<List<Object>> res = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_LIST,
                 "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[4]);" +
                 "local exists = redis.call('hexists', KEYS[1], ARGV[4]) == 1;" +
                 "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[3]) then " +
@@ -706,67 +760,50 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                       + "return {1, syncs};"
                   + "end; "
               + "end; ",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getCreatedChannelName(), getRemovedChannelName(), getUpdatedChannelName(),
-                     getCreatedSyncChannelName(), getRemovedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
+             Arrays.asList(name, getTimeoutSetName(name), getCreatedChannelName(name), getRemovedChannelName(name), getUpdatedChannelName(name),
+                     getCreatedSyncChannelName(name), getRemovedSyncChannelName(name), getUpdatedSyncChannelName(name), getOldValueListenerCounter(name)),
              creationTimeout, updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-        
-        RPromise<Boolean> result = waitSync(syncId, res);
-        
+
+        RFuture<Boolean> result = waitSync(syncId, res);
+
         return result;
     }
 
-    protected RPromise<Boolean> waitSync(double syncId, RFuture<List<Object>> res) {
-        RPromise<Boolean> result = new RedissonPromise<>();
+    RFuture<Boolean> waitSync(double syncId, RFuture<List<Object>> res) {
         if (atomicExecution) {
-            res.onComplete((r, e) -> {
-                if (e != null) {
-                    result.tryFailure(new CacheException(e));
-                    return;
-                }
-                
+            CompletionStage<Boolean> f = res.thenCompose(r -> {
                 r.add(syncId);
-                
+
                 if (r.size() < 2) {
-                    result.trySuccess((Long) r.get(0) >= 1);
-                    return;
+                    return CompletableFuture.completedFuture((Long) r.get(0) >= 1);
                 }
-                
+
                 Long syncs = (Long) r.get(r.size() - 2);
                 if (syncs != null && syncs > 0) {
                     RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
-                    semaphore.acquireAsync(syncs.intValue()).onComplete((obj1, ex) -> {
-                        if (ex != null) {
-                            result.tryFailure(new CacheException(ex));
-                            return;
-                        }
-                        semaphore.deleteAsync().onComplete((obj, exc) -> {
-                            if (exc != null) {
-                                result.tryFailure(new CacheException(exc));
-                                return;
-                            }
-                            result.trySuccess((Long) r.get(0) >= 1);
-                        });
+                    return semaphore.acquireAsync(syncs.intValue()).thenCompose(obj1 -> {
+                        return semaphore.deleteAsync().thenApply(obj -> (Long) r.get(0) >= 1);
                     });
                 } else {
-                    result.trySuccess((Long) r.get(0) >= 1);
+                    return CompletableFuture.completedFuture((Long) r.get(0) >= 1);
                 }
             });
+            f = handleException(f);
+            return new CompletableFutureWrapper<>(f);
         } else {
-            res.syncUninterruptibly();
-            
-            List<Object> r = res.getNow();
+            List<Object> r = res.toCompletableFuture().join();
+
             r.add(syncId);
             waitSync(r);
-            result.trySuccess((Long) r.get(0) >= 1);
+            return new CompletableFutureWrapper<>((Long) r.get(0) >= 1);
         }
-        return result;
     }
 
     Long getUpdateTimeout(long baseTime) {
         if (config.getExpiryPolicy().getExpiryForUpdate() == null) {
             return -1L;
         }
-        
+
         Long updateTimeout = config.getExpiryPolicy().getExpiryForUpdate().getAdjustedTime(baseTime);
         if (config.getExpiryPolicy().getExpiryForUpdate().isZero()) {
             updateTimeout = 0L;
@@ -775,7 +812,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         }
         return updateTimeout;
     }
-    
+
     Long getUpdateTimeout() {
         return getUpdateTimeout(System.currentTimeMillis());
     }
@@ -792,18 +829,19 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         }
         return creationTimeout;
     }
-    
+
     Long getCreationTimeout() {
         return getCreationTimeout(System.currentTimeMillis());
     }
-    
+
     RFuture<Boolean> putIfAbsentValue(K key, Object value) {
         Long creationTimeout = getCreationTimeout();
         if (creationTimeout == 0) {
-            return RedissonPromise.newSucceededFuture(false);
+            return new CompletableFutureWrapper<>(false);
         }
-        
-        return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
+
+        String name = getRawName(key);
+        return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
                 "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]);" +
                 "local exists = redis.call('hexists', KEYS[1], ARGV[2]) == 1;" +
                 "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[4]) then " +
@@ -813,7 +851,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "return 0; "
               + "else "
                   + "if ARGV[1] ~= '-1' then "
-                      + "redis.call('hset', KEYS[1], ARGV[2], ARGV[3]); "                                  
+                      + "redis.call('hset', KEYS[1], ARGV[2], ARGV[3]); "
                       + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[2]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
                       + "redis.call('publish', KEYS[3], msg); "
@@ -821,26 +859,26 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "else "
                       + "redis.call('hset', KEYS[1], ARGV[2], ARGV[3]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                      + "redis.call('publish', KEYS[3], msg); "                  
+                      + "redis.call('publish', KEYS[3], msg); "
                       + "return 1;"
                   + "end; "
               + "end; ",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getCreatedChannelName()),
+             Arrays.asList(name, getTimeoutSetName(name), getCreatedChannelName(name)),
              creationTimeout, encodeMapKey(key), encodeMapValue(value), System.currentTimeMillis());
     }
-    
+
     private boolean putIfAbsentValueLocked(K key, Object value) {
         if (containsKey(key)) {
             return false;
         }
-        
+
         Long creationTimeout = getCreationTimeout();
         if (creationTimeout == 0) {
             return false;
         }
         return evalWrite(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
                     "if ARGV[1] ~= '-1' then "
-                      + "redis.call('hset', KEYS[1], ARGV[2], ARGV[3]); "                                  
+                      + "redis.call('hset', KEYS[1], ARGV[2], ARGV[3]); "
                       + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[2]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
                       + "redis.call('publish', KEYS[3], msg); "
@@ -848,14 +886,13 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "else "
                       + "redis.call('hset', KEYS[1], ARGV[2], ARGV[3]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                      + "redis.call('publish', KEYS[3], msg); "                  
+                      + "redis.call('publish', KEYS[3], msg); "
                       + "return 1;"
                   + "end; ",
              Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getCreatedChannelName()),
              creationTimeout, encodeMapKey(key), encodeMapValue(value));
     }
 
-    
     private String getLockName(Object key) {
         ByteBuf keyState = encodeMapKey(key);
         try {
@@ -889,11 +926,9 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 return Collections.emptyMap();
             }
         }
-        
-        RFuture<Map<K, V>> result = getAllAsync(keys);
 
-        result.syncUninterruptibly();
-        return result.getNow();
+        RFuture<Map<K, V>> result = getAllAsync(keys);
+        return sync(result);
     }
 
     @Override
@@ -901,25 +936,29 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         checkNotClosed();
         long startTime = currentNanoTime();
         Long accessTimeout = getAccessTimeout();
-        
-        List<Object> args = new ArrayList<Object>(keys.size() + 2);
+
+        List<Object> args = new ArrayList<>(keys.size() + 2);
         args.add(accessTimeout);
         args.add(System.currentTimeMillis());
-        encode(args, keys);
-        
-        RFuture<Map<K, V>> res;
+        encodeMapKeys(args, keys);
+
+        RFuture<Map<K, V>> res = getAllOperation(commandExecutor, getRawName(), null, new ArrayList<>(keys), accessTimeout, args);
+
+        return handleGetAllResult(startTime, res);
+    }
+
+    RFuture<Map<K, V>> getAllOperation(CommandAsyncExecutor commandExecutor, String name, MasterSlaveEntry entry, List<Object> keys, Long accessTimeout, List<Object> args) {
+        String script;
         if (accessTimeout == -1) {
-            res = commandExecutor.evalReadAsync(getRawName(), codec, new RedisCommand<Map<Object, Object>>("EVAL",
-                            new MapValueDecoder(new MapGetAllDecoder(new ArrayList<Object>(keys), 0, true))),
-                    "local expireHead = redis.call('zrange', KEYS[2], 0, 0, 'withscores');"
+            script = "local expireHead = redis.call('zrange', KEYS[2], 0, 0, 'withscores');"
                   + "local accessTimeout = ARGV[1]; "
                   + "local currentTime = tonumber(ARGV[2]); "
                   + "local hasExpire = #expireHead == 2 and tonumber(expireHead[2]) <= currentTime; "
                   + "local map = {};"
                   + "for i=3, #ARGV, 5000 do "
                      + "local m = redis.call('hmget', KEYS[1], unpack(ARGV, i, math.min(i+4999, #ARGV))); "
-                     + "for k,v in ipairs(m) do " 
-                     +     "table.insert(map, v) " 
+                     + "for k,v in ipairs(m) do "
+                     +     "table.insert(map, v) "
                      + "end; "
                   + "end; "
                   + "local result = {};"
@@ -937,20 +976,17 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
 
                       + "table.insert(result, value); "
                   + "end; "
-                  + "return result;",
-            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName()), args.toArray());
+                  + "return result;";
         } else {
-            res = commandExecutor.evalWriteAsync(getRawName(), codec, new RedisCommand<Map<Object, Object>>("EVAL",
-                            new MapValueDecoder(new MapGetAllDecoder(new ArrayList<Object>(keys), 0, true))),
-                            "local expireHead = redis.call('zrange', KEYS[2], 0, 0, 'withscores');"
+            script = "local expireHead = redis.call('zrange', KEYS[2], 0, 0, 'withscores');"
                           + "local accessTimeout = ARGV[1]; "
                           + "local currentTime = tonumber(ARGV[2]); "
                           + "local hasExpire = #expireHead == 2 and tonumber(expireHead[2]) <= currentTime; "
                           + "local map = {};"
                           + "for i=3, #ARGV, 5000 do "
                              + "local m = redis.call('hmget', KEYS[1], unpack(ARGV, i, math.min(i+4999, #ARGV))); "
-                             + "for k,v in ipairs(m) do " 
-                             +     "table.insert(map, v) " 
+                             + "for k,v in ipairs(m) do "
+                             +     "table.insert(map, v) "
                              + "end; "
                           + "end; "
 
@@ -965,31 +1001,46 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                                           + "value = false; "
                                       + "end; "
                                   + "end; "
-                                      
+
                                   + "if accessTimeout == '0' then "
                                       + "redis.call('hdel', KEYS[1], key); "
                                       + "redis.call('zrem', KEYS[2], key); "
                                       + "local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(value), value); "
                                       + "redis.call('publish', KEYS[3], {key, value}); "
-                                  + "elseif accessTimeout ~= '-1' then " 
+                                  + "elseif accessTimeout ~= '-1' then "
                                       + "redis.call('zadd', KEYS[2], accessTimeout, key); "
                                   + "end; "
                               + "end; "
 
                               + "table.insert(result, value); "
                           + "end; "
-                          + "return result;",
-                    Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName()), args.toArray());
+                          + "return result;";
         }
 
-        RPromise<Map<K, V>> result = new RedissonPromise<>();
-        res.onComplete((r, ex) -> {
+        if (entry == null) {
+            return commandExecutor.evalReadAsync(name, codec, new RedisCommand<Map<Object, Object>>("EVAL",
+                                new MapValueDecoder(new MapGetAllDecoder(keys, 0, true))),
+                        script, Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name)), args.toArray());
+        }
+        return commandExecutor.evalReadAsync(entry, codec, new RedisCommand<Map<Object, Object>>("EVAL",
+                            new MapValueDecoder(new MapGetAllDecoder(keys, 0, true))),
+                    script, Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name)), args.toArray());
+    }
+
+    RFuture<Map<K, V>> handleGetAllResult(long startTime, RFuture<Map<K, V>> res) {
+        CompletableFuture<Map<K, V>> result = new CompletableFuture<>();
+        res.whenComplete((r, ex) -> {
+            if (ex != null) {
+                result.completeExceptionally(ex);
+                return;
+            }
+
             Map<K, V> map = r.entrySet().stream()
                                 .filter(e -> e.getValue() != null)
                                 .collect(Collectors.toMap(x -> x.getKey(), x -> x.getValue()));
-            
+
             cacheManager.getStatBean(this).addHits(map.size());
-            
+
             int nullValues = r.size() - map.size();
             if (config.isReadThrough() && nullValues > 0) {
                 cacheManager.getStatBean(this).addMisses(nullValues);
@@ -1004,25 +1055,24 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                                 }
                             });
                     } catch (Exception exc) {
-                        result.tryFailure(exc);
+                        result.completeExceptionally(exc);
                         return;
                     }
                     cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
-                    result.trySuccess(map);
+                    result.complete(map);
                 });
             } else {
                 cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
-                result.trySuccess(map);
+                result.complete(map);
             }
         });
-        return result;
+        return new CompletableFutureWrapper<>(result);
     }
 
     @Override
     public boolean containsKey(K key) {
         RFuture<Boolean> future = containsKeyAsync(key);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
 
     @Override
@@ -1030,7 +1080,8 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         checkNotClosed();
         checkKey(key);
 
-        RFuture<Boolean> future = commandExecutor.evalReadAsync(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
+        String name = getRawName(key);
+        RFuture<Boolean> future = commandExecutor.evalReadAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
                   "if redis.call('hexists', KEYS[1], ARGV[2]) == 0 then "
                     + "return 0;"
                 + "end;"
@@ -1040,7 +1091,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     + "return 0; "
                 + "end; "
                 + "return 1;",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName()),
+             Arrays.<Object>asList(name, getTimeoutSetName(name)),
              System.currentTimeMillis(), encodeMapKey(key));
         return future;
     }
@@ -1052,7 +1103,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         if (keys == null) {
             throw new NullPointerException();
         }
-        
+
         for (K key : keys) {
             checkKey(key);
         }
@@ -1104,12 +1155,12 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             }
         });
     }
-    
+
     RLock getLockedLock(K key) {
         if (atomicExecution) {
             return DUMMY_LOCK;
         }
-        
+
         String lockName = getLockName(key);
         RLock lock = redisson.getLock(lockName);
         try {
@@ -1127,41 +1178,35 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         if (value == null) {
             throw new NullPointerException();
         }
-        
-        RPromise<Void> result = new RedissonPromise<>();
+
         long startTime = currentNanoTime();
         if (config.isWriteThrough()) {
             RLock lock = getLockedLock(key);
             try {
-                RFuture<List<Object>> future;
+                CompletionStage<List<Object>> future;
                 if (atomicExecution) {
                     future = getAndPutValue(key, value);
                 } else {
                     List<Object> res = getAndPutValueLocked(key, value);
-                    future = RedissonPromise.newSucceededFuture(res);
+                    future = new CompletableFutureWrapper<>(res);
                 }
-                future.onComplete((res, ex) -> {
-                    if (ex != null) {
-                        result.tryFailure(new CacheException(ex));
-                        return;
-                    }
-
+                CompletionStage<Void> f = future.thenCompose(res -> {
                     if (res.isEmpty()) {
                         cacheManager.getStatBean(this).addPuts(1);
                         cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                        result.trySuccess(null);
-                        return;
+                        return CompletableFuture.completedFuture(null);
                     }
                     Long added = (Long) res.get(0);
                     if (added == null) {
                         cacheManager.getStatBean(this).addPuts(1);
                         cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                        result.trySuccess(null);
-                        return;
+                        return CompletableFuture.completedFuture(null);
                     }
-                    
-                    writeCache(key, value, result, startTime, res, added);
+
+                    return writeCache(key, value, startTime, res, added);
                 });
+                f = handleException(f);
+                return new CompletableFutureWrapper<>(f);
             } finally {
                 lock.unlock();
             }
@@ -1173,43 +1218,43 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     future = putValue(key, value);
                 } else {
                     boolean res = putValueLocked(key, value);
-                    future = RedissonPromise.newSucceededFuture(res);
+                    future = new CompletableFutureWrapper<>(res);
                 }
-                future.onComplete((r, e) -> {
+                CompletionStage<Void> f = future.handle((r, e) -> {
                     if (e != null) {
-                        result.tryFailure(new CacheException(e));
-                        return;
+                        throw new CompletionException(new CacheException(e));
                     }
-                    
+
                     if (r) {
                         cacheManager.getStatBean(this).addPuts(1);
                     }
                     cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                    result.trySuccess(null);
+                    return null;
                 });
+                return new CompletableFutureWrapper<>(f);
             } finally {
                 lock.unlock();
             }
         }
-        return result;
     }
 
-    private void writeCache(K key, V value, RPromise<Void> result, long startTime, List<Object> res, Long added) {
+    private CompletableFuture<Void> writeCache(K key, V value, long startTime, List<Object> res, Long added) {
         Runnable r;
+        CompletableFuture<Void> result = new CompletableFuture<>();
         if (added >= 1) {
             r = () -> {
                 try {
                     cacheWriter.write(new JCacheEntry<K, V>(key, value));
                     cacheManager.getStatBean(this).addPuts(1);
                     cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                    result.trySuccess(null);
+                    result.complete(null);
                 } catch (Exception e) {
-                    removeValues(key).onComplete((obj, exc) -> {
+                    removeValues(key).whenComplete((obj, exc) -> {
                         if (exc != null) {
-                            result.tryFailure(new CacheWriterException(exc));
+                            result.completeExceptionally(new CacheWriterException(exc));
                             return;
                         }
-                        
+
                         handleException(result, e);
                     });
                 }
@@ -1220,20 +1265,20 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     cacheWriter.delete(key);
                     cacheManager.getStatBean(this).addPuts(1);
                     cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                    result.trySuccess(null);
+                    result.complete(null);
                 } catch (Exception e) {
                     if (res.size() == 4 && res.get(1) != null) {
-                        putValue(key, res.get(1)).onComplete((obj, exc) -> {
+                        putValue(key, res.get(1)).whenComplete((obj, exc) -> {
                             if (exc != null) {
-                                result.tryFailure(new CacheWriterException(exc));
+                                result.completeExceptionally(new CacheWriterException(exc));
                                 return;
                             }
-                            
+
                             handleException(result, e);
                         });
                         return;
                     }
-                    
+
                     handleException(result, e);
                 }
             };
@@ -1244,37 +1289,49 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         } else {
             r.run();
         }
+        return result;
     }
 
     @Override
     public void put(K key, V value) {
         RFuture<Void> future = putAsync(key, value);
-        future.syncUninterruptibly();
+        sync(future);
     }
-    
+
     RFuture<Long> removeValues(Object... keys) {
-        List<Object> params = new ArrayList<Object>(keys.length+1);
+        List<Object> params = new ArrayList<>(keys.length + 1);
         params.add(System.currentTimeMillis());
         encodeMapKeys(params, Arrays.asList(keys));
-        return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LONG,
-                  "local counter = 0;"
-                + "for i=2, #ARGV do "
-                      + "local value = redis.call('hget', KEYS[1], ARGV[i]); "
-                      + "if value ~= false then "
-                          + "redis.call('hdel', KEYS[1], ARGV[i]); "
-                      
-                          + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[i]); "
-                          + "if not (expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[1])) then "
-                              + "counter = counter + 1;"
-                          + "end; "
-                          
-                          + "redis.call('zrem', KEYS[2], ARGV[i]); "
-                          + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[i]), ARGV[i], string.len(tostring(value)), tostring(value)); "
-                          + "redis.call('publish', KEYS[3], msg); "
-                      + "end;"
-                + "end; "
-                + "return counter;",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getRemovedSyncChannelName()),
+        return removeValuesOperation(commandExecutor, getRawName(), null, params, null);
+    }
+
+    RFuture<Long> removeValuesOperation(CommandAsyncExecutor commandExecutor, String name, MasterSlaveEntry entry, List<Object> params, Object[] keys) {
+        String script = "local counter = 0;"
+                        + "for i=2, #ARGV do "
+                           +  "local value = redis.call('hget', KEYS[1], ARGV[i]); "
+                           +  "if value ~= false then "
+                                + "redis.call('hdel', KEYS[1], ARGV[i]); "
+
+                                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[i]); "
+                                + "if not (expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[1])) then "
+                                   + "counter = counter + 1;"
+                                + "end; "
+
+                                + "redis.call('zrem', KEYS[2], ARGV[i]); "
+                                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[i]), ARGV[i], string.len(tostring(value)), tostring(value)); "
+                                + "redis.call('publish', KEYS[3], msg); "
+                            + "end;"
+                        + "end; "
+                        + "return counter;";
+
+        if (entry == null) {
+            return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_LONG, script,
+                    Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getRemovedSyncChannelName(name)),
+                    params.toArray());
+        }
+
+        return commandExecutor.evalWriteAsync(entry, codec, RedisCommands.EVAL_LONG, script,
+                Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getRemovedSyncChannelName(name)),
                 params.toArray());
     }
 
@@ -1292,7 +1349,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                           + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[4]), ARGV[4], string.len(tostring(value)), tostring(value), ARGV[6]); "
                           + "local syncs = redis.call('publish', KEYS[6], syncMsg); "
                           + "return {0, value, syncs};"
-                      + "elseif ARGV[2] ~= '-1' then " 
+                      + "elseif ARGV[2] ~= '-1' then "
                           + "redis.call('hset', KEYS[1], ARGV[4], ARGV[5]); "
                           + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[4]); "
                           + "local oldValueRequired = tonumber(redis.call('get', KEYS[9])); "
@@ -1307,7 +1364,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                           + "redis.call('publish', KEYS[5], msg); "
                           + "local syncs = redis.call('publish', KEYS[8], syncMsg); "
                           + "return {1, value, syncs};"
-                      + "else " 
+                      + "else "
                           + "redis.call('hset', KEYS[1], ARGV[4], ARGV[5]); "
                           + "local oldValueRequired = tonumber(redis.call('get', KEYS[9])); "
                           + "local msg, syncMsg; "
@@ -1325,12 +1382,12 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                  Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getCreatedChannelName(), getUpdatedChannelName(),
                          getRemovedSyncChannelName(), getCreatedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
                  0, updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-            
+
             result.add(syncId);
             waitSync(result);
             return result;
         }
-        
+
         Long creationTimeout = getCreationTimeout();
         if (creationTimeout == 0) {
             return Collections.emptyList();
@@ -1344,7 +1401,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                       + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[4]), ARGV[4], string.len(ARGV[5]), ARGV[5], ARGV[6]); "
                       + "local syncs = redis.call('publish', KEYS[4], syncMsg); "
                       + "return {1, syncs};"
-                  + "else " 
+                  + "else "
                       + "redis.call('hset', KEYS[1], ARGV[4], ARGV[5]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[4]), ARGV[4], string.len(ARGV[5]), ARGV[5]); "
                       + "redis.call('publish', KEYS[3], msg); "
@@ -1354,21 +1411,21 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "end; ",
              Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getCreatedChannelName(), getCreatedSyncChannelName()),
              creationTimeout, 0, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-        
+
         result.add(syncId);
         waitSync(result);
         return result;
     }
-    
-    RFuture<List<Object>> getAndPutValue(K key, V value) {
+
+    CompletionStage<List<Object>> getAndPutValue(K key, V value) {
         Long creationTimeout = getCreationTimeout();
-        
+
         Long updateTimeout = getUpdateTimeout();
-        
+
         double syncId = ThreadLocalRandom.current().nextDouble();
-        
-        RPromise<List<Object>> result = new RedissonPromise<>();
-        RFuture<List<Object>> future = commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LIST,
+
+        String name = getRawName(key);
+        RFuture<List<Object>> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_LIST,
                 "local value = redis.call('hget', KEYS[1], ARGV[4]);"
               + "if value ~= false then "
                   + "if ARGV[2] == '0' then "
@@ -1411,16 +1468,16 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "end; "
               + "else "
                   + "if ARGV[1] == '0' then "
-                      + "return {nil};"                      
+                      + "return {nil};"
                   + "elseif ARGV[1] ~= '-1' then "
-                      + "redis.call('hset', KEYS[1], ARGV[4], ARGV[5]); "                                  
+                      + "redis.call('hset', KEYS[1], ARGV[4], ARGV[5]); "
                       + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[4]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[4]), ARGV[4], string.len(ARGV[5]), ARGV[5]); "
                       + "redis.call('publish', KEYS[4], msg); "
                       + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[4]), ARGV[4], string.len(ARGV[5]), ARGV[5], ARGV[6]); "
                       + "local syncs = redis.call('publish', KEYS[7], syncMsg); "
                       + "return {1, syncs};"
-                  + "else " 
+                  + "else "
                       + "redis.call('hset', KEYS[1], ARGV[4], ARGV[5]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[4]), ARGV[4], string.len(ARGV[5]), ARGV[5]); "
                       + "redis.call('publish', KEYS[4], msg); "
@@ -1429,32 +1486,24 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                       + "return {1, syncs};"
                   + "end; "
               + "end; ",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getCreatedChannelName(), getUpdatedChannelName(),
-                     getRemovedSyncChannelName(), getCreatedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
+             Arrays.<Object>asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getCreatedChannelName(name), getUpdatedChannelName(name),
+                     getRemovedSyncChannelName(name), getCreatedSyncChannelName(name), getUpdatedSyncChannelName(name), getOldValueListenerCounter(name)),
              creationTimeout, updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-        
-        future.onComplete((r, e) -> {
-            if (e != null) {
-                result.tryFailure(e);
-                return;
-            }
-            
+
+        return future.thenApply(r -> {
             if (!r.isEmpty()) {
                 r.add(syncId);
             }
-            result.trySuccess(r);
+            return r;
         });
-        
-        return result;
     }
 
     @Override
     public V getAndPut(K key, V value) {
         RFuture<V> future = getAndPutAsync(key, value);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
-    
+
     @Override
     public RFuture<V> getAndPutAsync(K key, V value) {
         checkNotClosed();
@@ -1462,32 +1511,25 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         if (value == null) {
             throw new NullPointerException();
         }
-        
-        RPromise<V> result = new RedissonPromise<>();
+
         long startTime = currentNanoTime();
         if (config.isWriteThrough()) {
             RLock lock = getLockedLock(key);
             try {
-                RFuture<List<Object>> future;
+                CompletionStage<List<Object>> future;
                 if (atomicExecution) {
                     future = getAndPutValue(key, value);
                 } else {
                     List<Object> res = getAndPutValueLocked(key, value);
-                    future = RedissonPromise.newSucceededFuture(res);
+                    future = new CompletableFutureWrapper<>(res);
                 }
-                future.onComplete((res, ex) -> {
-                    if (ex != null) {
-                        result.tryFailure(new CacheException(ex));
-                        return;
-                    }
-                    
+                CompletionStage<V> f = future.thenCompose(res -> {
                     if (res.isEmpty()) {
                         cacheManager.getStatBean(this).addPuts(1);
                         cacheManager.getStatBean(this).addMisses(1);
                         cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                         cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                        result.trySuccess(null);
-                        return;
+                        return CompletableFuture.completedFuture((V) null);
                     }
                     Long added = (Long) res.get(0);
                     if (added == null) {
@@ -1495,49 +1537,43 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                         cacheManager.getStatBean(this).addHits(1);
                         cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                         cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                        result.trySuccess((V) res.get(1));
-                        return;
+                        return CompletableFuture.completedFuture((V) res.get(1));
                     }
-                    
-                    RPromise<Void> writeRes = new RedissonPromise<>();
-                    writeCache(key, value, writeRes, startTime, res, added);
-                    writeRes.onComplete((r, e) -> {
-                        if (e != null) {
-                            result.tryFailure(e);
-                            return;
-                        }
-                        
+
+                    CompletableFuture<Void> ff = writeCache(key, value, startTime, res, added);
+                    return ff.thenApply(r -> {
                         V val = getAndPutResult(startTime, res);
-                        result.trySuccess(val);
+                        return val;
                     });
                 });
+                f = handleException(f);
+                return new CompletableFutureWrapper<>(f);
             } finally {
                 lock.unlock();
             }
         } else {
             RLock lock = getLockedLock(key);
             try {
-                RFuture<List<Object>> future;
+                CompletionStage<List<Object>> future;
                 if (atomicExecution) {
                     future = getAndPutValue(key, value);
                 } else {
                     List<Object> res = getAndPutValueLocked(key, value);
-                    future = RedissonPromise.newSucceededFuture(res);
+                    future = new CompletableFutureWrapper<>(res);
                 }
-                future.onComplete((r, e) -> {
+                CompletionStage<V> f = future.handle((r, e) -> {
                     if (e != null) {
-                        result.tryFailure(new CacheException(e));
-                        return;
+                        throw new CompletionException(new CacheException(e));
                     }
-                    
+
                     V val = getAndPutResult(startTime, r);
-                    result.trySuccess(val);
+                    return val;
                 });
+                return new CompletableFutureWrapper<>(f);
             } finally {
                 lock.unlock();
             }
         }
-        return result;
     }
 
     private V getAndPutResult(long startTime, List<Object> result) {
@@ -1558,7 +1594,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     @Override
     public void putAll(Map<? extends K, ? extends V> map) {
         RFuture<Void> result = putAllAsync(map);
-        result.syncUninterruptibly();
+        sync(result);
     }
 
     @Override
@@ -1573,70 +1609,70 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 throw new NullPointerException();
             }
         }
-        
-        
+
+
         long startTime = currentNanoTime();
         RFuture<Long> future = putAllValues(map);
-        RPromise<Void> result = new RedissonPromise<>();
-        
+        CompletableFuture<Void> result = new CompletableFuture<>();
+
         Runnable r = () -> {
-            Map<K, Cache.Entry<? extends K, ? extends V>> addedEntries = new HashMap<>();
+            Map<K, Entry<? extends K, ? extends V>> addedEntries = new HashMap<>();
             for (Map.Entry<? extends K, ? extends V> entry : map.entrySet()) {
                 addedEntries.put(entry.getKey(), new JCacheEntry<K, V>(entry.getKey(), entry.getValue()));
             }
-            
+
             try {
                 cacheWriter.writeAll(addedEntries.values());
             } catch (Exception e) {
-                removeValues(addedEntries.keySet().toArray()).onComplete((res, ex) -> {
+                removeValues(addedEntries.keySet().toArray()).whenComplete((res, ex) -> {
                     if (ex != null) {
-                        result.tryFailure(new CacheException(ex));
+                        result.completeExceptionally(new CacheException(ex));
                         return;
                     }
-                    
+
                     handleException(result, e);
                 });
                 return;
             }
-            
-            result.trySuccess(null);
+
+            result.complete(null);
         };
 
-        future.onComplete((res, ex) -> {
+        future.whenComplete((res, ex) -> {
             if (ex != null) {
-                result.tryFailure(new CacheException(ex));
+                result.completeExceptionally(new CacheException(ex));
                 return;
             }
-            
+
             cacheManager.getStatBean(this).addPuts(res);
             for (int i = 0; i < res; i++) {
                 cacheManager.getStatBean(this).addPutTime((currentNanoTime() - startTime) / res);
             }
         });
-        
+
         if (atomicExecution) {
-            future.onComplete((res, ex) -> {
+            future.whenComplete((res, ex) -> {
                 if (config.isWriteThrough()) {
                     commandExecutor.getConnectionManager().getExecutor().execute(r);
                 } else {
-                    result.trySuccess(null);
+                    result.complete(null);
                 }
             });
         } else {
             if (config.isWriteThrough()) {
                 r.run();
             } else {
-                result.trySuccess(null);
+                result.complete(null);
             }
         }
-        return result;
+        return new CompletableFutureWrapper<>(result);
     }
-    
+
     void waitSync(List<Object> result) {
         if (result.size() < 2) {
             return;
         }
-        
+
         Long syncs = (Long) result.get(result.size() - 2);
         Double syncId = (Double) result.get(result.size() - 1);
         if (syncs != null && syncs > 0) {
@@ -1653,8 +1689,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     @Override
     public boolean putIfAbsent(K key, V value) {
         RFuture<Boolean> result = putIfAbsentAsync(key, value);
-        result.syncUninterruptibly();
-        return result.getNow();
+        return sync(result);
     }
 
     @Override
@@ -1664,24 +1699,24 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         if (value == null) {
             throw new NullPointerException();
         }
-        
+
         long startTime = currentNanoTime();
         RLock lock = getLockedLock(key);
-        RPromise<Boolean> result = new RedissonPromise<>();
+        CompletableFuture<Boolean> result = new CompletableFuture<>();
         try {
             RFuture<Boolean> future;
             if (atomicExecution) {
                 future = putIfAbsentValue(key, value);
             } else {
                 boolean r = putIfAbsentValueLocked(key, value);
-                future = RedissonPromise.newSucceededFuture(r);
+                future = new CompletableFutureWrapper<>(r);
             }
-            future.onComplete((r, ex) -> {
+            future.whenComplete((r, ex) -> {
                 if (ex != null) {
-                    result.tryFailure(new CacheException(ex));
+                    result.completeExceptionally(new CacheException(ex));
                     return;
                 }
-                
+
                 if (r) {
                     cacheManager.getStatBean(this).addPuts(1);
                     if (config.isWriteThrough()) {
@@ -1694,36 +1729,37 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                                 return;
                             }
                             cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                            result.trySuccess(r);
+                            result.complete(r);
                         });
                         return;
                     }
                 }
                 cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                result.trySuccess(r);
+                result.complete(r);
             });
         } finally {
             lock.unlock();
         }
-        return result;
+        return new CompletableFutureWrapper<>(result);
     }
 
-    protected void handleException(RPromise<?> result, Exception e) {
+    void handleException(CompletableFuture<?> result, Exception e) {
         if (e instanceof CacheWriterException) {
-            result.tryFailure(e);
+            result.completeExceptionally(e);
         }
-        result.tryFailure(new CacheWriterException(e));
+        result.completeExceptionally(new CacheWriterException(e));
     }
-    
+
     RFuture<Boolean> removeValue(K key) {
         double syncId = ThreadLocalRandom.current().nextDouble();
-        
-        RFuture<List<Object>> future = commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LIST,
+
+        String name = getRawName(key);
+        RFuture<List<Object>> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_LIST,
                 "local value = redis.call('hexists', KEYS[1], ARGV[2]); "
               + "if value == 0 then "
                   + "return {0}; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[1]) then "
                   + "return {0}; "
@@ -1737,20 +1773,19 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
               + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[2]), ARGV[2], string.len(tostring(value)), tostring(value), ARGV[3]); "
               + "local syncs = redis.call('publish', KEYS[4], syncMsg); "
               + "return {1, syncs};",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getRemovedSyncChannelName()),
+             Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getRemovedSyncChannelName(name)),
              System.currentTimeMillis(), encodeMapKey(key), syncId);
-        
-        RPromise<Boolean> result = waitSync(syncId, future);
+
+        RFuture<Boolean> result = waitSync(syncId, future);
         return result;
     }
 
     @Override
     public boolean remove(K key) {
         RFuture<Boolean> future = removeAsync(key);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
-    
+
     @Override
     public RFuture<Boolean> removeAsync(K key) {
         checkNotClosed();
@@ -1760,15 +1795,15 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         if (config.isWriteThrough()) {
             RLock lock = getLockedLock(key);
             try {
-                RPromise<Boolean> result = new RedissonPromise<>();
-                RFuture<V> future = getAndRemoveValue(key);
+                CompletableFuture<Boolean> result = new CompletableFuture<>();
+                CompletionStage<V> future = getAndRemoveValue(key);
                 if (atomicExecution) {
-                    future.onComplete((oldValue, ex) -> {
+                    future.whenComplete((oldValue, ex) -> {
                         if (ex != null) {
-                            result.tryFailure(new CacheException(ex));
+                            result.completeExceptionally(new CacheException(ex));
                             return;
                         }
-                        
+
                         commandExecutor.getConnectionManager().getExecutor().submit(() -> {
                             try {
                                 cacheWriter.delete(key);
@@ -1776,7 +1811,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                                     cacheManager.getStatBean(this).addRemovals(1);
                                 }
                                 cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                                result.trySuccess(oldValue != null);
+                                result.complete(oldValue != null);
                             } catch (Exception e) {
                                 if (oldValue != null) {
                                     putValue(key, oldValue);
@@ -1786,15 +1821,14 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                         });
                     });
                 } else {
-                    future.syncUninterruptibly();
-                    V oldValue = future.getNow();
+                    V oldValue = future.toCompletableFuture().join();
                     try {
                         cacheWriter.delete(key);
                         if (oldValue != null) {
                             cacheManager.getStatBean(this).addRemovals(1);
                         }
                         cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                        result.trySuccess(oldValue != null);
+                        result.complete(oldValue != null);
                     } catch (Exception e) {
                         if (oldValue != null) {
                             putValue(key, oldValue);
@@ -1802,39 +1836,36 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                         handleException(result, e);
                     }
                 }
-                return result;
+                return new CompletableFutureWrapper<>(result);
             } finally {
                 lock.unlock();
             }
         } else {
             RFuture<Boolean> result = removeValue(key);
-            result.onComplete((res, ex) -> {
-                if (ex != null) {
-                    return;
-                }
+            CompletionStage<Boolean> f = result.thenApply(res -> {
                 if (res) {
                     cacheManager.getStatBean(this).addRemovals(1);
                 }
                 cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
+                return res;
             });
-            return result;
+            return new CompletableFutureWrapper<>(f);
         }
-        
     }
 
     private boolean removeValueLocked(K key, V value) {
-        
+
         Boolean result = evalWrite(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
                 "local value = redis.call('hget', KEYS[1], ARGV[3]); "
               + "if value == false then "
                   + "return 0; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[3]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[2]) then "
                   + "return 0; "
               + "end; "
-          
+
               + "if ARGV[4] == value then "
                   + "redis.call('hdel', KEYS[1], ARGV[3]); "
                   + "redis.call('zrem', KEYS[2], ARGV[3]); "
@@ -1855,28 +1886,29 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
               "if ARGV[1] == '0' then "
                 + "redis.call('hdel', KEYS[1], ARGV[3]); "
                 + "redis.call('zrem', KEYS[2], ARGV[3]); "
-                + "local value = redis.call('hget', KEYS[1], ARGV[3]); " 
+                + "local value = redis.call('hget', KEYS[1], ARGV[3]); "
                 + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[3]), ARGV[3], string.len(tostring(value)), tostring(value)); "
                 + "redis.call('publish', KEYS[3], msg); "
-            + "elseif ARGV[1] ~= '-1' then " 
+            + "elseif ARGV[1] ~= '-1' then "
                 + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[3]); "
             + "end; ",
            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName()),
-           accessTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));            
+           accessTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
         }
 
         return result;
     }
-    
+
     RFuture<Boolean> removeValue(K key, V value) {
         Long accessTimeout = getAccessTimeout();
-        
-        return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
+
+        String name = getRawName(key);
+        return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
                 "local value = redis.call('hget', KEYS[1], ARGV[3]); "
               + "if value == false then "
                   + "return 0; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[3]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[2]) then "
                   + "return 0; "
@@ -1889,17 +1921,17 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "redis.call('publish', KEYS[3], msg); "
                   + "return 1; "
               + "end; "
-              
+
               + "if ARGV[1] == '0' then "
                   + "redis.call('hdel', KEYS[1], ARGV[3]); "
                   + "redis.call('zrem', KEYS[2], ARGV[3]); "
                   + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[3]), ARGV[3], string.len(tostring(value)), tostring(value)); "
                   + "redis.call('publish', KEYS[3], msg); "
-              + "elseif ARGV[1] ~= '-1' then " 
+              + "elseif ARGV[1] ~= '-1' then "
                   + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[3]); "
               + "end; "
               + "return 0; ",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName()),
+             Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name)),
              accessTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
@@ -1907,10 +1939,9 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     @Override
     public boolean remove(K key, V value) {
         RFuture<Boolean> future = removeAsync(key, value);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
-    
+
     @Override
     public RFuture<Boolean> removeAsync(K key, V value) {
         checkNotClosed();
@@ -1920,47 +1951,48 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         }
 
         long startTime = currentNanoTime();
-        RPromise<Boolean> result = new RedissonPromise<>();
         if (config.isWriteThrough()) {
             RLock lock = getLockedLock(key);
             try {
                 if (atomicExecution) {
+                    CompletableFuture<Boolean> result = new CompletableFuture<>();
                     RFuture<Boolean> future = removeValue(key, value);
-                    future.onComplete((r, ex) -> {
+                    future.whenComplete((r, ex) -> {
                         if (ex != null) {
-                            result.tryFailure(new CacheException(ex));
+                            result.completeExceptionally(new CacheException(ex));
                             return;
                         }
-                        
+
                         if (r) {
                             commandExecutor.getConnectionManager().getExecutor().submit(() -> {
                                 try {
                                     cacheWriter.delete(key);
                                 } catch (Exception e) {
                                     putValue(key, value);
-                                    
+
                                     handleException(result, e);
                                     return;
                                 }
-                                
+
                                 cacheManager.getStatBean(this).addHits(1);
                                 cacheManager.getStatBean(this).addRemovals(1);
                                 cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                                result.trySuccess(r);
+                                result.complete(r);
                             });
                         } else {
                             cacheManager.getStatBean(this).addMisses(1);
                             cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                            result.trySuccess(r);
+                            result.complete(r);
                         }
                     });
+                    return new CompletableFutureWrapper<>(result);
                 } else {
                     boolean res = removeValueLocked(key, value);
                     if (res) {
                         try {
                             cacheWriter.delete(key);
                         } catch (Exception e) {
-                            putValue(key, value).syncUninterruptibly();
+                            putValue(key, value).toCompletableFuture().join();
                             if (e instanceof CacheWriterException) {
                                 throw e;
                             }
@@ -1973,7 +2005,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                         cacheManager.getStatBean(this).addMisses(1);
                         cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
                     }
-                    return RedissonPromise.newSucceededFuture(res);
+                    return new CompletableFutureWrapper<>(res);
                 }
             } finally {
                 lock.unlock();
@@ -1986,14 +2018,13 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     future = removeValue(key, value);
                 } else {
                     boolean res = removeValueLocked(key, value);
-                    future = RedissonPromise.newSucceededFuture(res);
+                    future = new CompletableFutureWrapper<>(res);
                 }
-                future.onComplete((r, ex) -> {
+                CompletionStage<Boolean> f = future.handle((r, ex) -> {
                     if (ex != null) {
-                        result.tryFailure(new CacheException(ex));
-                        return;
+                        throw new CompletionException(new CacheException(ex));
                     }
-                    
+
                     if (r) {
                         cacheManager.getStatBean(this).addHits(1);
                         cacheManager.getStatBean(this).addRemovals(1);
@@ -2001,110 +2032,47 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                         cacheManager.getStatBean(this).addMisses(1);
                     }
                     cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                    result.trySuccess(r);
+                    return r;
                 });
+                return new CompletableFutureWrapper<>(f);
             } finally {
                 lock.unlock();
             }
         }
-        return result;
     }
 
-    RFuture<Map<K, V>> getAndRemoveValues(Collection<K> keys) {
+    CompletionStage<Map<K, V>> getAndRemoveValues(Collection<K> keys) {
         double syncId = ThreadLocalRandom.current().nextDouble();
-        RPromise<Map<K, V>> result = new RedissonPromise<>();
-        
-        List<Object> params = new ArrayList<>();
-        params.add(System.currentTimeMillis());
-        params.add(syncId);
-        
-        for (K key : keys) {
-            params.add(encodeMapKey(key));
-        }
-        
-        RFuture<List<Object>> future = commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE_LIST,
-                "local syncs = 0; "
-              + "local values = {}; "
-              + "local result = {}; "
-              + "local nulls = {}; "
-              
-              + "for i = 3, #ARGV, 1 do "
-                  + "local value = redis.call('hget', KEYS[1], ARGV[i]); "
-                  + "if value == false then "
-                      + "table.insert(nulls, i-3); "
-                  + "else "
-                      + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[i]); "
-                      + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[1]) then "
-                          + "table.insert(nulls, i-3); "
-                      + "else "
-                          + "redis.call('hdel', KEYS[1], ARGV[i]); "
-                          + "redis.call('zrem', KEYS[2], ARGV[i]); "
-                          + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[i]), ARGV[i], string.len(tostring(value)), tostring(value)); "
-                          + "redis.call('publish', KEYS[3], msg); "
-                          + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[i]), ARGV[i], string.len(tostring(value)), tostring(value), ARGV[2]); "
-                          + "syncs = syncs + redis.call('publish', KEYS[4], syncMsg); "
-                          + "table.insert(values, value); "
-                      + "end; "
-                  + "end; "
-              + "end; "
-              
-              + "table.insert(result, syncs); "
-              + "table.insert(result, #nulls); "
-              + "for i = 1, #nulls, 1 do "
-                  + "table.insert(result, nulls[i]); "
-              + "end; "
-              + "for i = 1, #values, 1 do "
-                  + "table.insert(result, values[i]); "
-              + "end; "
-              + "return result; ",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getRemovedSyncChannelName()),
-                params.toArray());
-        
-        if (atomicExecution) {
-            future.onComplete((r, exc1) -> {
-                if (exc1 != null) {
-                    result.tryFailure(exc1);
-                    return;
-                }
 
+        RFuture<List<Object>> future = getAndRemoveValuesOperation(commandExecutor, null, getRawName(), (Collection<Object>) keys, syncId);
+
+        if (atomicExecution) {
+            return future.thenCompose(r -> {
                 long nullsAmount = (long) r.get(1);
                 if (nullsAmount == keys.size()) {
-                    result.trySuccess(Collections.emptyMap());
-                    return;
+                    return CompletableFuture.completedFuture(Collections.emptyMap());
                 }
-                
+
                 long syncs = (long) r.get(0);
                 if (syncs > 0) {
                     RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
-                    semaphore.acquireAsync((int) syncs).onComplete((obj1, ex) -> {
-                        if (ex != null) {
-                            result.tryFailure(ex);
-                            return;
-                        }
-                        semaphore.deleteAsync().onComplete((obj, exc) -> {
-                            if (exc != null) {
-                                result.tryFailure(exc);
-                                return;
-                            }
-                            
-                            getAndRemoveValuesResult(keys, result, r, nullsAmount);
-                        });
+                    return semaphore.acquireAsync((int) syncs).thenCompose(obj1 -> {
+                        return semaphore.deleteAsync().thenCompose(obj -> {
+                                    return getAndRemoveValuesResult(keys, r, nullsAmount);
+                                });
                     });
                 } else {
-                    getAndRemoveValuesResult(keys, result, r, nullsAmount);
+                    return getAndRemoveValuesResult(keys, r, nullsAmount);
                 }
             });
         } else {
-            future.syncUninterruptibly();
-            
-            List<Object> r = future.getNow();
-            
+            List<Object> r = future.toCompletableFuture().join();
+
             long nullsAmount = (long) r.get(1);
             if (nullsAmount == keys.size()) {
-                result.trySuccess(Collections.emptyMap());
-                return result;
+                return CompletableFuture.completedFuture(Collections.emptyMap());
             }
-            
+
             long syncs = (long) r.get(0);
             if (syncs > 0) {
                 RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
@@ -2115,38 +2083,96 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     Thread.currentThread().interrupt();
                 }
             }
-            
-            getAndRemoveValuesResult(keys, result, r, nullsAmount);
+
+            return getAndRemoveValuesResult(keys, r, nullsAmount);
         }
-        
-        return result;
     }
 
-    private void getAndRemoveValuesResult(Collection<K> keys, RPromise<Map<K, V>> result, List<Object> r,
-            long nullsAmount) {
-        HashSet<Long> nullIndexes = new HashSet<>((List<Long>) (Object) r.subList(2, (int) nullsAmount + 2));
+    RFuture<List<Object>> getAndRemoveValuesOperation(CommandAsyncExecutor commandExecutor, MasterSlaveEntry entry, String name, Collection<Object> keys, double syncId) {
+        List<Object> params = new ArrayList<>();
+        params.add(System.currentTimeMillis());
+        params.add(syncId);
+
+        for (Object key : keys) {
+            params.add(encodeMapKey(key));
+        }
+
+        String script = "local syncs = 0; "
+          + "local values = {}; "
+          + "local result = {}; "
+          + "local nulls = {}; "
+
+          + "for i = 3, #ARGV, 1 do "
+              + "local value = redis.call('hget', KEYS[1], ARGV[i]); "
+              + "if value == false then "
+                  + "table.insert(nulls, i-3); "
+              + "else "
+                  + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[i]); "
+                  + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[1]) then "
+                      + "table.insert(nulls, i-3); "
+                  + "else "
+                      + "redis.call('hdel', KEYS[1], ARGV[i]); "
+                      + "redis.call('zrem', KEYS[2], ARGV[i]); "
+                      + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[i]), ARGV[i], string.len(tostring(value)), tostring(value)); "
+                      + "redis.call('publish', KEYS[3], msg); "
+                      + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[i]), ARGV[i], string.len(tostring(value)), tostring(value), ARGV[2]); "
+                      + "syncs = syncs + redis.call('publish', KEYS[4], syncMsg); "
+                      + "table.insert(values, value); "
+                  + "end; "
+              + "end; "
+          + "end; "
+
+          + "table.insert(result, syncs); "
+          + "table.insert(result, #nulls); "
+          + "for i = 1, #nulls, 1 do "
+              + "table.insert(result, nulls[i]); "
+          + "end; "
+          + "for i = 1, #values, 1 do "
+              + "table.insert(result, values[i]); "
+          + "end; "
+          + "return result; ";
+
+        if (entry == null) {
+            return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE_LIST, script,
+                    Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getRemovedSyncChannelName(name)),
+                    params.toArray());
+        }
+
+        return commandExecutor.evalWriteAsync(entry, codec, RedisCommands.EVAL_MAP_VALUE_LIST, script,
+                Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getRemovedSyncChannelName(name)),
+                params.toArray());
+    }
+
+    private CompletionStage<Map<K, V>> getAndRemoveValuesResult(Collection<K> keys, List<Object> r, long nullsAmount) {
         Map<K, V> res = new HashMap<>();
+        fillMap(keys, r, res, nullsAmount, 0);
+        return CompletableFuture.completedFuture(res);
+    }
+
+    void fillMap(Collection<K> keys, List<Object> r, Map<K, V> res, long nullsAmount, int baseIndex) {
+        List<Long> list = (List<Long>) (Object) r.subList(baseIndex + 2, baseIndex + (int) nullsAmount + 2);
+        HashSet<Long> nullIndexes = new HashSet<>(list);
         long i = 0;
         for (K key : keys) {
             if (nullIndexes.contains(i)) {
                 continue;
             }
-            V value = (V) r.get((int) (i+nullsAmount+2));
+            V value = (V) r.get((int) (baseIndex + i + nullsAmount + 2));
             res.put(key, value);
             i++;
         }
-        result.trySuccess(res);
     }
-    
-    RFuture<V> getAndRemoveValue(K key) {
+
+    CompletionStage<V> getAndRemoveValue(K key) {
         double syncId = ThreadLocalRandom.current().nextDouble();
-        RPromise<V> result = new RedissonPromise<>();
-        RFuture<List<Object>> future = commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE_LIST,
+
+        String name = getRawName(key);
+        RFuture<List<Object>> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE_LIST,
                 "local value = redis.call('hget', KEYS[1], ARGV[2]); "
               + "if value == false then "
                   + "return {nil}; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[1]) then "
                   + "return {nil}; "
@@ -2159,51 +2185,32 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
               + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[2]), ARGV[2], string.len(tostring(value)), tostring(value), ARGV[3]); "
               + "local syncs = redis.call('publish', KEYS[4], syncMsg); "
               + "return {value, syncs}; ",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getRemovedSyncChannelName()),
+                Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getRemovedSyncChannelName(name)),
                 System.currentTimeMillis(), encodeMapKey(key), syncId);
-        
+
         if (atomicExecution) {
-            future.onComplete((r, exc1) -> {
-                if (exc1 != null) {
-                    result.tryFailure(exc1);
-                    return;
+            return future.thenCompose(r -> {
+                if (r.size() < 2) {
+                    return CompletableFuture.completedFuture((V) null);
                 }
 
-                if (r.size() < 2) {
-                    result.trySuccess(null);
-                    return;
-                }
-                
                 Long syncs = (Long) r.get(1);
                 if (syncs != null && syncs > 0) {
                     RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
-                    semaphore.acquireAsync(syncs.intValue()).onComplete((obj1, ex) -> {
-                        if (ex != null) {
-                            result.tryFailure(ex);
-                            return;
-                        }
-                        semaphore.deleteAsync().onComplete((obj, exc) -> {
-                            if (exc != null) {
-                                result.tryFailure(exc);
-                                return;
-                            }
-                            result.trySuccess((V) r.get(0));
-                        });
+                    return semaphore.acquireAsync(syncs.intValue()).thenCompose(obj1 -> {
+                        return semaphore.deleteAsync().thenApply(obj -> (V) r.get(0));
                     });
                 } else {
-                    result.trySuccess((V) r.get(0));
+                    return CompletableFuture.completedFuture((V) r.get(0));
                 }
             });
         } else {
-            future.syncUninterruptibly();
-            
-            List<Object> r = future.getNow();
-            
+            List<Object> r = future.toCompletableFuture().join();
+
             if (r.size() < 2) {
-                result.trySuccess(null);
-                return result;
+                return CompletableFuture.completedFuture((V) null);
             }
-            
+
             Long syncs = (Long) r.get(1);
             if (syncs != null && syncs > 0) {
                 RSemaphore semaphore = redisson.getSemaphore(getSyncName(syncId));
@@ -2214,43 +2221,40 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     Thread.currentThread().interrupt();
                 }
             }
-            
-            result.trySuccess((V) r.get(0));
+
+            return CompletableFuture.completedFuture((V) r.get(0));
         }
-        
-        return result;
     }
 
     @Override
     public V getAndRemove(K key) {
         RFuture<V> future = getAndRemoveAsync(key);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
-    
+
     @Override
     public RFuture<V> getAndRemoveAsync(K key) {
         checkNotClosed();
         checkKey(key);
 
         long startTime = currentNanoTime();
-        RPromise<V> result = new RedissonPromise<>();
+        CompletableFuture<V> result = new CompletableFuture<>();
         RLock lock = getLockedLock(key);
         try {
-            RFuture<V> future = getAndRemoveValue(key);
-            future.onComplete((value, e) -> {
+            CompletionStage<V> future = getAndRemoveValue(key);
+            future.whenComplete((value, e) -> {
                 if (e != null) {
-                    result.tryFailure(new CacheException(e));
+                    result.completeExceptionally(new CacheException(e));
                     return;
                 }
-                
+
                 if (value != null) {
                     cacheManager.getStatBean(this).addHits(1);
                     cacheManager.getStatBean(this).addRemovals(1);
                 } else {
                     cacheManager.getStatBean(this).addMisses(1);
                 }
-                
+
                 if (config.isWriteThrough()) {
                     commandExecutor.getConnectionManager().getExecutor().submit(() -> {
                         try {
@@ -2259,24 +2263,24 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                             if (value != null) {
                                 putValue(key, value);
                             }
-                            
+
                             handleException(result, ex);
                             return;
                         }
                         cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                         cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                        result.trySuccess(value);
+                        result.complete(value);
                     });
                 } else {
                     cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                     cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                    result.trySuccess(value);
+                    result.complete(value);
                 }
             });
         } finally {
             lock.unlock();
         }
-        return result;
+        return new CompletableFutureWrapper<>(result);
     }
 
     private long replaceValueLocked(K key, V oldValue, V newValue) {
@@ -2285,7 +2289,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
               + "if value == false then "
                   + "return 0; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[4]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[3]) then "
                   + "return 0; "
@@ -2297,7 +2301,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
               + "return -1;",
               Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName()),
               0, 0, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(oldValue), encodeMapValue(newValue));
-             
+
        if (res == 1) {
            Long updateTimeout = getUpdateTimeout();
            double syncId = ThreadLocalRandom.current().nextDouble();
@@ -2337,15 +2341,15 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                        Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName(),
                                getRemovedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
                        0, updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(oldValue), encodeMapValue(newValue), syncId);
-           
+
            List<Object> result = Arrays.<Object>asList(syncs, syncId);
            waitSync(result);
-           
+
            return res;
        } else if (res == 0) {
            return res;
        }
-       
+
        Long accessTimeout = getAccessTimeout();
        if (accessTimeout == -1) {
            return -1;
@@ -2361,31 +2365,32 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "redis.call('publish', KEYS[3], msg); "
                   + "local syncMsg = struct.pack('Lc0Lc0d', string.len(ARGV[4]), ARGV[4], string.len(value), value, ARGV[7]); "
                   + "local syncs = redis.call('publish', KEYS[4], syncMsg); "
-                  + "return {-1, syncs}; "                  
-              + "elseif ARGV[1] ~= '-1' then " 
+                  + "return {-1, syncs}; "
+              + "elseif ARGV[1] ~= '-1' then "
                   + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[3]); "
                   + "return {0};"
               + "end; ",
              Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getRemovedSyncChannelName()),
              accessTimeout, 0, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(oldValue), encodeMapValue(newValue), syncId);
-       
+
        result.add(syncId);
        waitSync(result);
        return (Long) result.get(0);
     }
 
-    
+
     RFuture<Long> replaceValue(K key, V oldValue, V newValue) {
         Long accessTimeout = getAccessTimeout();
-        
+
         Long updateTimeout = getUpdateTimeout();
 
-        return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LONG,
+        String name = getRawName(key);
+        return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_LONG,
                 "local value = redis.call('hget', KEYS[1], ARGV[4]); "
               + "if value == false then "
                   + "return 0; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[4]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[3]) then "
                   + "return 0; "
@@ -2397,7 +2402,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                       + "redis.call('zrem', KEYS[2], ARGV[4]); "
                       + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[4]), ARGV[4], string.len(tostring(value)), tostring(value)); "
                       + "redis.call('publish', KEYS[3], msg); "
-                  + "elseif ARGV[2] ~= '-1' then " 
+                  + "elseif ARGV[2] ~= '-1' then "
                       + "redis.call('hset', KEYS[1], ARGV[4], ARGV[6]); "
                       + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[4]); "
                       + "local oldValueRequired = tonumber(redis.call('get', KEYS[5])); "
@@ -2408,7 +2413,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                           + "msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[4]), ARGV[4], string.len(ARGV[6]), ARGV[6], string.len(tostring(value)), tostring(value)); "
                       + "end; "
                       + "redis.call('publish', KEYS[4], msg); "
-                  + "else " 
+                  + "else "
                       + "redis.call('hset', KEYS[1], ARGV[4], ARGV[6]); "
                       + "local oldValueRequired = tonumber(redis.call('get', KEYS[5])); "
                       + "local msg; "
@@ -2421,29 +2426,28 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "end; "
                   + "return 1;"
               + "end; "
-              
+
               + "if ARGV[1] == '0' then "
                   + "redis.call('hdel', KEYS[1], ARGV[4]); "
                   + "redis.call('zrem', KEYS[2], ARGV[4]); "
                   + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[4]), ARGV[4], string.len(value), value); "
-                  + "redis.call('publish', KEYS[3], msg); "                  
-              + "elseif ARGV[1] ~= '-1' then " 
+                  + "redis.call('publish', KEYS[3], msg); "
+              + "elseif ARGV[1] ~= '-1' then "
                   + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[4]); "
                   + "return 0;"
               + "end; "
               + "return -1; ",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName(), getOldValueListenerCounter()),
+             Arrays.<Object>asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getUpdatedChannelName(name), getOldValueListenerCounter(name)),
              accessTimeout, updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(oldValue), encodeMapValue(newValue));
-        
+
     }
-    
+
     @Override
     public boolean replace(K key, V oldValue, V newValue) {
         RFuture<Boolean> future = replaceAsync(key, oldValue, newValue);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
-    
+
     @Override
     public RFuture<Boolean> replaceAsync(K key, V oldValue, V newValue) {
         checkNotClosed();
@@ -2457,21 +2461,21 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
 
         long startTime = currentNanoTime();
         RLock lock = getLockedLock(key);
-        RPromise<Boolean> result = new RedissonPromise<>();
+        CompletableFuture<Boolean> result = new CompletableFuture<>();
         try {
             RFuture<Long> future;
             if (atomicExecution) {
                 future = replaceValue(key, oldValue, newValue);
             } else {
                 long res = replaceValueLocked(key, oldValue, newValue);
-                future = RedissonPromise.newSucceededFuture(res);
+                future = new CompletableFutureWrapper<>(res);
             }
-            future.onComplete((res, ex) -> {
+            future.whenComplete((res, ex) -> {
                 if (ex != null) {
-                    result.tryFailure(new CacheException(ex));
+                    result.completeExceptionally(new CacheException(ex));
                     return;
                 }
-                
+
                 if (res == 1) {
                     if (config.isWriteThrough()) {
                         commandExecutor.getConnectionManager().getExecutor().submit(() -> {
@@ -2479,23 +2483,23 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                                 cacheWriter.write(new JCacheEntry<K, V>(key, newValue));
                             } catch (Exception e) {
                                 removeValues(key);
-                                
+
                                 handleException(result, e);
                                 return;
                             }
-                            
+
                             cacheManager.getStatBean(this).addHits(1);
                             cacheManager.getStatBean(this).addPuts(1);
                             cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                             cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                            result.trySuccess(true);
+                            result.complete(true);
                         });
                     } else {
                         cacheManager.getStatBean(this).addHits(1);
                         cacheManager.getStatBean(this).addPuts(1);
                         cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                         cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                        result.trySuccess(true);
+                        result.complete(true);
                     }
                 } else {
                     if (res == 0) {
@@ -2505,15 +2509,15 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                     }
                     cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
                     cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                    result.trySuccess(false);
+                    result.complete(false);
                 }
             });
         } finally {
             lock.unlock();
         }
-        return result;
+        return new CompletableFutureWrapper<>(result);
     }
-    
+
     private boolean replaceValueLocked(K key, V value) {
 
         if (containsKey(key)) {
@@ -2564,26 +2568,27 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
              Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName(),
                      getRemovedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
              updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-        
+
         List<Object> result = Arrays.<Object>asList(syncs, syncId);
         waitSync(result);
             return true;
         }
-        
+
         return false;
 
     }
 
-    
+
     RFuture<Boolean> replaceValue(K key, V value) {
         Long updateTimeout = getUpdateTimeout();
 
-        return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
+        String name = getRawName(key);
+        return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
                 "local value = redis.call('hget', KEYS[1], ARGV[3]); "
               + "if value == false then "
                   + "return 0; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[3]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[2]) then "
                   + "return 0; "
@@ -2605,7 +2610,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                       + "msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[3]), ARGV[3], string.len(ARGV[4]), ARGV[4], string.len(tostring(value)), tostring(value)); "
                   + "end; "
                   + "redis.call('publish', KEYS[4], msg); "
-              + "else " 
+              + "else "
                   + "redis.call('hset', KEYS[1], ARGV[3], ARGV[4]); "
                   + "local oldValueRequired = tonumber(redis.call('get', KEYS[5])); "
                   + "local msg; "
@@ -2617,20 +2622,21 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "redis.call('publish', KEYS[4], msg); "
               + "end; "
               + "return 1;",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName(), getOldValueListenerCounter()),
+             Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getUpdatedChannelName(name), getOldValueListenerCounter(name)),
              updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
-        
+
     }
-    
+
     RFuture<V> getAndReplaceValue(K key, V value) {
         Long updateTimeout = getUpdateTimeout();
 
-        return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE,
+        String name = getRawName(key);
+        return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
                 "local value = redis.call('hget', KEYS[1], ARGV[3]); "
               + "if value == false then "
                   + "return nil; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[3]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[2]) then "
                   + "return nil; "
@@ -2641,7 +2647,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "redis.call('zrem', KEYS[2], ARGV[3]); "
                   + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[3]), ARGV[3], string.len(tostring(value)), tostring(value)); "
                   + "redis.call('publish', KEYS[3], msg); "
-              + "elseif ARGV[1] ~= '-1' then " 
+              + "elseif ARGV[1] ~= '-1' then "
                   + "redis.call('hset', KEYS[1], ARGV[3], ARGV[4]); "
                   + "redis.call('zadd', KEYS[2], ARGV[1], ARGV[3]); "
                   + "local oldValueRequired = tonumber(redis.call('get', KEYS[5])); "
@@ -2652,7 +2658,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                       + "msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[3]), ARGV[3], string.len(ARGV[4]), ARGV[4], string.len(tostring(value)), tostring(value)); "
                   + "end; "
                   + "redis.call('publish', KEYS[4], msg); "
-              + "else " 
+              + "else "
                   + "redis.call('hset', KEYS[1], ARGV[3], ARGV[4]); "
                   + "local oldValueRequired = tonumber(redis.call('get', KEYS[5])); "
                   + "local msg; "
@@ -2664,23 +2670,23 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                   + "redis.call('publish', KEYS[4], msg); "
               + "end; "
               + "return value;",
-             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName(), getOldValueListenerCounter()),
+             Arrays.asList(name, getTimeoutSetName(name), getRemovedChannelName(name), getUpdatedChannelName(name), getOldValueListenerCounter(name)),
              updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
 
     }
-    
+
     private V getAndReplaceValueLocked(K key, V value) {
         V oldValue = evalWrite(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE,
                 "local value = redis.call('hget', KEYS[1], ARGV[3]); "
               + "if value == false then "
                   + "return nil; "
               + "end; "
-                  
+
               + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[3]); "
               + "if expireDateScore ~= false and tonumber(expireDateScore) <= tonumber(ARGV[2]) then "
                   + "return nil; "
               + "end; "
-              
+
               + "return value;", Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName()),
               0, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
 
@@ -2732,7 +2738,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
              Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getRemovedChannelName(), getUpdatedChannelName(),
                      getRemovedSyncChannelName(), getUpdatedSyncChannelName(), getOldValueListenerCounter()),
              updateTimeout, System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value), syncId);
-            
+
             List<Object> result = Arrays.<Object>asList(syncs, syncId);
             waitSync(result);
         }
@@ -2760,10 +2766,9 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     @Override
     public boolean replace(K key, V value) {
         RFuture<Boolean> future = replaceAsync(key, value);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
-    
+
     @Override
     public RFuture<Boolean> replaceAsync(K key, V value) {
         checkNotClosed();
@@ -2773,7 +2778,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         }
 
         long startTime = currentNanoTime();
-        RPromise<Boolean> result = new RedissonPromise<>();
+        CompletableFuture<Boolean> result = new CompletableFuture<>();
         RLock lock = getLockedLock(key);
         try {
             RFuture<Boolean> future;
@@ -2781,15 +2786,15 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 future = replaceValue(key, value);
             } else {
                 boolean res = replaceValueLocked(key, value);
-                future = RedissonPromise.newSucceededFuture(res);
+                future = new CompletableFutureWrapper<>(res);
             }
-            
-            future.onComplete((r, ex) -> {
+
+            future.whenComplete((r, ex) -> {
                 if (ex != null) {
-                    result.tryFailure(new CacheException(ex));
+                    result.completeExceptionally(new CacheException(ex));
                     return;
                 }
-                
+
                 if (r) {
                     if (config.isWriteThrough()) {
                         commandExecutor.getConnectionManager().getExecutor().submit(() -> {
@@ -2797,40 +2802,39 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                                 cacheWriter.write(new JCacheEntry<K, V>(key, value));
                             } catch (Exception e) {
                                 removeValues(key);
-                                
+
                                 handleException(result, e);
                             }
-                            
+
                             cacheManager.getStatBean(this).addHits(1);
                             cacheManager.getStatBean(this).addPuts(1);
                             cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                            result.trySuccess(r);
+                            result.complete(r);
                         });
                         return;
                     }
-                    
+
                     cacheManager.getStatBean(this).addHits(1);
                     cacheManager.getStatBean(this).addPuts(1);
                 } else {
                     cacheManager.getStatBean(this).addMisses(1);
                 }
                 cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
-                result.trySuccess(r);
+                result.complete(r);
             });
         } finally {
             lock.unlock();
         }
-        
-        return result;
+
+        return new CompletableFutureWrapper<>(result);
     }
 
     @Override
     public V getAndReplace(K key, V value) {
         RFuture<V> future = getAndReplaceAsync(key, value);
-        future.syncUninterruptibly();
-        return future.getNow();
+        return sync(future);
     }
-    
+
     @Override
     public RFuture<V> getAndReplaceAsync(K key, V value) {
         checkNotClosed();
@@ -2840,7 +2844,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         }
 
         long startTime = currentNanoTime();
-        RPromise<V> result = new RedissonPromise<>();
+        CompletableFuture<V> result = new CompletableFuture<>();
         RLock lock = getLockedLock(key);
         try {
             RFuture<V> future;
@@ -2848,14 +2852,14 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 future = getAndReplaceValue(key, value);
             } else {
                 V res = getAndReplaceValueLocked(key, value);
-                future = RedissonPromise.newSucceededFuture(res);
+                future = new CompletableFutureWrapper<>(res);
             }
-            future.onComplete((r, ex) -> {
+            future.whenComplete((r, ex) -> {
                 if (ex != null) {
-                    result.tryFailure(new CacheException(ex));
+                    result.completeExceptionally(new CacheException(ex));
                     return;
                 }
-                
+
                 if (r != null) {
                     if (config.isWriteThrough()) {
                         commandExecutor.getConnectionManager().getExecutor().submit(() -> {
@@ -2865,14 +2869,14 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                                 cacheWriter.write(new JCacheEntry<K, V>(key, value));
                             } catch (Exception e) {
                                 removeValues(key);
-                                
+
                                 handleException(result, e);
                                 return;
                             }
-                            
+
                             cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
                             cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
-                            result.trySuccess(r);
+                            result.complete(r);
                         });
                         return;
                     }
@@ -2883,67 +2887,59 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 }
                 cacheManager.getStatBean(this).addPutTime(currentNanoTime() - startTime);
                 cacheManager.getStatBean(this).addGetTime(currentNanoTime() - startTime);
-                result.trySuccess(r);
+                result.complete(r);
             });
         } finally {
             lock.unlock();
         }
-        return result;
+        return new CompletableFutureWrapper<>(result);
     }
 
     @Override
     public void removeAll(Set<? extends K> keys) {
         RFuture<Void> future = removeAllAsync(keys);
-        future.syncUninterruptibly();
+        sync(future);
     }
-    
+
     @Override
     public RFuture<Void> removeAllAsync(Set<? extends K> keys) {
         checkNotClosed();
-        
+
         for (K key : keys) {
             checkKey(key);
         }
-        
+
         long startTime = currentNanoTime();
-        RPromise<Void> result = new RedissonPromise<>();
         if (config.isWriteThrough()) {
-            RFuture<Map<K, V>> future = getAndRemoveValues((Set<K>) keys);
-            future.onComplete((r, ex) -> {
-                if (ex != null) {
-                    result.tryFailure(ex);
-                    return;
-                }
-                
+            CompletionStage<Map<K, V>> future = getAndRemoveValues((Set<K>) keys);
+            CompletionStage<Void> f = future.handle((r, ex) -> {
                 try {
                     cacheWriter.deleteAll(r.keySet());
                 } catch (Exception e) {
                     putAllValues(r);
-                    handleException(result, e);
-                    return;
+                    if (e instanceof CacheWriterException) {
+                        throw new CompletionException(e);
+                    }
+                    throw new CompletionException(new CacheWriterException(e));
                 }
                 cacheManager.getStatBean(this).addRemovals(r.size());
                 cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                result.trySuccess(null);
+                return null;
             });
-        } else {
-            RFuture<Long> future = removeValues(keys.toArray());
-            future.onComplete((res, ex) -> {
-                if (ex != null) {
-                    result.tryFailure(ex);
-                    return;
-                }
-
-                cacheManager.getStatBean(this).addRemovals(res);
-                cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
-                result.trySuccess(null);
-            });
+            return new CompletableFutureWrapper<>(f);
         }
-        return result;
+
+        RFuture<Long> future = removeValues(keys.toArray());
+        CompletionStage<Void> f = future.thenApply(res -> {
+            cacheManager.getStatBean(this).addRemovals(res);
+            cacheManager.getStatBean(this).addRemoveTime(currentNanoTime() - startTime);
+            return null;
+        });
+        return new CompletableFutureWrapper<>(f);
     }
-    
+
     MapScanResult<Object, Object> scanIterator(String name, RedisClient client, long startPos) {
-        RFuture<MapScanResult<Object, Object>> f 
+        RFuture<MapScanResult<Object, Object>> f
             = commandExecutor.readAsync(client, name, codec, RedisCommands.HSCAN, name, startPos, "COUNT", 50);
         try {
             return get(f);
@@ -2952,7 +2948,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         }
     }
 
-    protected Iterator<K> keyIterator() {
+    Iterator<K> keyIterator() {
         return new RedissonBaseMapIterator<K>() {
             @Override
             protected K getValue(Map.Entry<Object, Object> entry) {
@@ -2960,23 +2956,23 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             }
 
             @Override
-            protected void remove(java.util.Map.Entry<Object, Object> value) {
+            protected void remove(Map.Entry<Object, Object> value) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
-            protected Object put(java.util.Map.Entry<Object, Object> entry, Object value) {
+            protected Object put(Map.Entry<Object, Object> entry, Object value) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
-            protected ScanResult<java.util.Map.Entry<Object, Object>> iterator(RedisClient client,
-                    long nextIterPos) {
+            protected ScanResult<Map.Entry<Object, Object>> iterator(RedisClient client,
+                                                                     long nextIterPos) {
                 return JCache.this.scanIterator(JCache.this.getRawName(), client, nextIterPos);
             }
         };
     }
-    
+
     @Override
     public void removeAll() {
         checkNotClosed();
@@ -2998,13 +2994,20 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     @Override
     public void clear() {
         RFuture<Void> future = clearAsync();
-        future.syncUninterruptibly();
+        sync(future);
     }
-    
+
     @Override
     public RFuture<Void> clearAsync() {
+        return clearAsync(commandExecutor, null, getRawName());
+    }
+
+    RFuture<Void> clearAsync(CommandAsyncExecutor commandExecutor, MasterSlaveEntry entry, String name) {
         checkNotClosed();
-        return commandExecutor.writeAsync(getRawName(), RedisCommands.DEL_OBJECTS, getRawName(), getTimeoutSetName());
+        if (entry == null) {
+            return commandExecutor.writeAsync(name, StringCodec.INSTANCE, RedisCommands.DEL_VOID, name, getTimeoutSetName(name));
+        }
+        return commandExecutor.writeAsync(entry, StringCodec.INSTANCE, RedisCommands.DEL_VOID, name, getTimeoutSetName(name));
     }
 
     @Override
@@ -3099,7 +3102,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         if (isClosed()) {
             return;
         }
-        
+
         synchronized (cacheManager) {
             if (!isClosed()) {
                 if (hasOwnRedisson) {
@@ -3109,7 +3112,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
                 for (CacheEntryListenerConfiguration<K, V> config : listeners.keySet()) {
                     deregisterCacheEntryListener(config);
                 }
-                
+
                 closed = true;
             }
         }
@@ -3147,8 +3150,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     private void registerCacheEntryListener(CacheEntryListenerConfiguration<K, V> cacheEntryListenerConfiguration, boolean addToConfig) {
         if (osType == null) {
             RFuture<Map<String, String>> serverFuture = commandExecutor.readAsync((String) null, StringCodec.INSTANCE, RedisCommands.INFO_SERVER);
-            serverFuture.syncUninterruptibly();
-            String os = serverFuture.getNow().get("os");
+            String os = serverFuture.toCompletableFuture().join().get("os");
             if (os.contains("Windows")) {
                 osType = BaseEventCodec.OSType.WINDOWS;
             } else if (os.contains("NONSTOP")) {
@@ -3158,7 +3160,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
 
         Factory<CacheEntryListener<? super K, ? super V>> factory = cacheEntryListenerConfiguration.getCacheEntryListenerFactory();
         final CacheEntryListener<? super K, ? super V> listener = factory.create();
-        
+
         Factory<CacheEntryEventFilter<? super K, ? super V>> filterFactory = cacheEntryListenerConfiguration.getCacheEntryEventFilterFactory();
         final CacheEntryEventFilter<? super K, ? super V> filter;
         if (filterFactory != null) {
@@ -3166,22 +3168,22 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
         } else {
             filter = null;
         }
-        
+
         Map<Integer, String> values = new ConcurrentHashMap<Integer, String>();
-        
+
         Map<Integer, String> oldValues = listeners.putIfAbsent(cacheEntryListenerConfiguration, values);
         if (oldValues != null) {
             values = oldValues;
         }
-        
+
         final boolean sync = cacheEntryListenerConfiguration.isSynchronous();
-        
+
         if (CacheEntryRemovedListener.class.isAssignableFrom(listener.getClass())) {
             String channelName = getRemovedChannelName();
             if (sync) {
                 channelName = getRemovedSyncChannelName();
             }
-            
+
             RTopic topic = redisson.getTopic(channelName, new JCacheEventCodec(codec, osType, sync));
             int listenerId = topic.addListener(List.class, new MessageListener<List<Object>>() {
                 @Override
@@ -3266,7 +3268,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             });
             values.put(listenerId, channelName);
         }
-        
+
         if (addToConfig) {
             config.addCacheEntryListenerConfiguration(cacheEntryListenerConfiguration);
         }
@@ -3279,7 +3281,7 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             semaphore.release();
         }
     }
-    
+
     @Override
     public void deregisterCacheEntryListener(CacheEntryListenerConfiguration<K, V> cacheEntryListenerConfiguration) {
         Map<Integer, String> listenerIds = listeners.remove(cacheEntryListenerConfiguration);
@@ -3301,11 +3303,11 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
     }
 
     @Override
-    public Iterator<javax.cache.Cache.Entry<K, V>> iterator() {
+    public Iterator<Entry<K, V>> iterator() {
         checkNotClosed();
-        return new RedissonBaseMapIterator<javax.cache.Cache.Entry<K, V>>() {
+        return new RedissonBaseMapIterator<Entry<K, V>>() {
             @Override
-            protected Cache.Entry<K, V> getValue(Map.Entry<Object, Object> entry) {
+            protected Entry<K, V> getValue(Map.Entry<Object, Object> entry) {
                 cacheManager.getStatBean(JCache.this).addHits(1);
                 Long accessTimeout = getAccessTimeout();
                 JCacheEntry<K, V> je = new JCacheEntry<K, V>((K) entry.getKey(), (V) entry.getValue());
@@ -3323,15 +3325,15 @@ public class JCache<K, V> extends RedissonObject implements Cache<K, V>, CacheAs
             }
 
             @Override
-            protected Object put(java.util.Map.Entry<Object, Object> entry, Object value) {
+            protected Object put(Map.Entry<Object, Object> entry, Object value) {
                 throw new UnsupportedOperationException();
             }
 
 
 
             @Override
-            protected ScanResult<java.util.Map.Entry<Object, Object>> iterator(RedisClient client,
-                    long nextIterPos) {
+            protected ScanResult<Map.Entry<Object, Object>> iterator(RedisClient client,
+                                                                     long nextIterPos) {
                 return JCache.this.scanIterator(JCache.this.getRawName(), client, nextIterPos);
             }
 

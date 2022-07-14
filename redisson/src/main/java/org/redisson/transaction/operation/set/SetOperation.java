@@ -23,6 +23,7 @@ import org.redisson.api.RSetCache;
 import org.redisson.client.codec.Codec;
 import org.redisson.command.CommandAsyncExecutor;
 import org.redisson.transaction.RedissonTransactionalLock;
+import org.redisson.transaction.RedissonTransactionalReadLock;
 import org.redisson.transaction.operation.TransactionalOperation;
 
 /**
@@ -39,6 +40,11 @@ public abstract class SetOperation extends TransactionalOperation {
         this.transactionId = transactionId;
     }
 
+    public SetOperation(String name, Codec codec, String transactionId, long threadId) {
+        super(name, codec, threadId);
+        this.transactionId = transactionId;
+    }
+
     protected RLock getLock(RSetCache<?> setCache, CommandAsyncExecutor commandExecutor, Object value) {
         String lockName = ((RedissonSetCache<?>) setCache).getLockByValue(value, "lock");
         return new RedissonTransactionalLock(commandExecutor, lockName, transactionId);
@@ -47,6 +53,10 @@ public abstract class SetOperation extends TransactionalOperation {
     protected RLock getLock(RSet<?> setCache, CommandAsyncExecutor commandExecutor, Object value) {
         String lockName = ((RedissonSet<?>) setCache).getLockByValue(value, "lock");
         return new RedissonTransactionalLock(commandExecutor, lockName, transactionId);
+    }
+
+    protected RLock getReadLock(String readLockName, CommandAsyncExecutor commandExecutor) {
+        return new RedissonTransactionalReadLock(commandExecutor, readLockName, transactionId);
     }
 
 }
